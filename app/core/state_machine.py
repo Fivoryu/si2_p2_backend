@@ -1,0 +1,15 @@
+ALLOWED_TRANSITIONS: dict[str, set[str]] = {
+    "PENDIENTE": {"BUSCANDO_TALLER", "CANCELADO"},
+    "BUSCANDO_TALLER": {"TALLER_ASIGNADO", "NO_ATENDIDO", "CANCELADO"},
+    "TALLER_ASIGNADO": {"EN_CAMINO", "BUSCANDO_TALLER"},
+    "EN_CAMINO": {"EN_ATENCION"},
+    "EN_ATENCION": {"FINALIZADO"},
+    "FINALIZADO": {"PAGADO"},
+}
+
+
+def can_transition(current: str, new: str) -> bool:
+    return new in ALLOWED_TRANSITIONS.get(current, set())
+
+
+CANCELABLE = {"PENDIENTE", "BUSCANDO_TALLER"}
