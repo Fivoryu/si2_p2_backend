@@ -3,15 +3,21 @@ from datetime import datetime, timezone
 from sqlalchemy import text
 
 from ..core.db import scoped_session
+from .pricing import calculate_service_offer
+from .notifications import notify_workshop_new_assignment
 from ..ws.manager import manager
 
 CANDIDATE_SQL = text(
     """
 WITH inc AS (
-  SELECT latitud, longitud, tipo_incidente_id, tenant_id
-  FROM emergencias.incidente WHERE id = :inc
+  SELECT i.latitud, i.longitud, i.tipo_incidente_id, i.tenant_id, i.prioridad,
+         ti.codigo AS tipo_codigo
+  FROM emergencias.incidente i
+  LEFT JOIN emergencias.tipo_incidente ti ON ti.id = i.tipo_incidente_id
+  WHERE i.id = :inc
 )
 SELECT t.id AS taller_id, t.nombre, t.calificacion, t.capacidad_max,
+       inc.tipo_codigo, inc.prioridad,
        (earth_distance(ll_to_earth(t.latitud, t.longitud),
                        ll_to_earth(inc.latitud, inc.longitud)) / 1000.0) AS distancia_km,
        (SELECT count(*) FROM emergencias.asignacion a
@@ -88,8 +94,9 @@ async def assign_best_workshop(
             db.execute(
                 text(
                     """INSERT INTO emergencias.taller_candidato
-                    (tenant_id, incidente_id, taller_id, distancia_km, tiempo_llegada_min, puntaje)
-                    VALUES (:t, :i, :tl, :d, :eta, :s)
+                    (tenant_id, incidente_id, taller_id, distancia_km, tiempo_llegada_min, puntaje,
+                     precio_sugerido, dificultad)
+                    VALUES (:t, :i, :tl, :d, :eta, :s, :precio, :dif)
                     ON CONFLICT (incidente_id, taller_id) DO NOTHING"""
                 ),
                 {
@@ -97,13 +104,33 @@ async def assign_best_workshop(
                     "i": incidente_id,
                     "tl": c["taller_id"],
                     "d": round(float(c["distancia_km"] or 0), 2),
-                    "eta": int(float(c["distancia_km"] or 1) * 2) + 3,
+                    "eta": calculate_service_offer(
+                        c.get("tipo_codigo"),
+                        c.get("prioridad"),
+                        c["distancia_km"],
+                        c["calificacion"],
+                        c["carga"],
+                    ).tiempo_llegada_min,
                     "s": score(
                         c["distancia_km"],
                         c["carga"],
                         c["calificacion"],
                         c.get("capacidad_max") or 3,
                     ),
+                    "precio": calculate_service_offer(
+                        c.get("tipo_codigo"),
+                        c.get("prioridad"),
+                        c["distancia_km"],
+                        c["calificacion"],
+                        c["carga"],
+                    ).precio_sugerido,
+                    "dif": calculate_service_offer(
+                        c.get("tipo_codigo"),
+                        c.get("prioridad"),
+                        c["distancia_km"],
+                        c["calificacion"],
+                        c["carga"],
+                    ).dificultad,
                 },
             )
 
@@ -127,6 +154,9 @@ async def assign_best_workshop(
         taller_id = str(best["taller_id"])
     finally:
         db.close()
+
+    await notify_workshop_new_assignment(tenant_id, taller_id, incidente_id,
+                                         taller_nombre)
 
     await manager.publish(
         tenant_id,

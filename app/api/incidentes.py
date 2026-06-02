@@ -3,6 +3,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from ..core.deps import CurrentUser, get_current_user, get_db, require_roles
@@ -15,9 +16,15 @@ from ..schemas.incidente import (
     UbicacionIn,
 )
 from ..services.ai import run_ai_pipeline
+from ..services.transcription import transcribe_audio_bytes
 from ..ws.manager import manager
 
 router = APIRouter(prefix="/incidentes", tags=["incidentes"])
+
+
+class CalificacionIn(BaseModel):
+    estrellas: int = Field(ge=1, le=5)
+    comentario: str | None = None
 
 
 def _row_to_out(row) -> IncidenteOut:
@@ -68,7 +75,7 @@ def crear_incidente(
         text("SELECT * FROM emergencias.incidente WHERE id = :id"),
         {"id": inc_id},
     ).mappings().first()
-    bg.add_task(run_ai_pipeline, inc_id, user.tenant)
+    bg.add_task(run_ai_pipeline, inc_id, user.tenant, 5.0)
     return _row_to_out(row)
 
 
@@ -134,10 +141,23 @@ def get_incidente(
         ),
         {"id": incidente_id},
     ).mappings().first()
+    ofertas = db.execute(
+        text(
+            """SELECT c.id, c.taller_id, t.nombre AS taller_nombre, c.monto,
+                      c.precio_sugerido, c.tiempo_estimado_min, c.estado,
+                      c.comentario_taller, t.calificacion
+               FROM emergencias.cotizacion c
+               JOIN emergencias.taller t ON t.id = c.taller_id
+               WHERE c.incidente_id = :id
+               ORDER BY c.estado = 'ACEPTADA' DESC, c.monto ASC"""
+        ),
+        {"id": incidente_id},
+    ).mappings().all()
     return {
         "incidente": dict(inc),
         "evidencias": [dict(e) for e in evs],
         "asignacion": dict(asig) if asig else None,
+        "ofertas": [dict(o) for o in ofertas],
     }
 
 
@@ -220,6 +240,7 @@ def cancelar(
 @router.post("/{incidente_id}/evidencias", status_code=201)
 async def add_evidencia(
     incidente_id: str,
+    bg: BackgroundTasks,
     tipo: str = Form(...),
     texto: str | None = Form(None),
     file: UploadFile | None = File(None),
@@ -236,7 +257,9 @@ async def add_evidencia(
             upload_bytes(key, data, file.content_type or "application/octet-stream")
             url = key
         except Exception:
-            url = f"local://{key}"
+            from ..core.aws import save_local_evidencia
+
+            url = save_local_evidencia(key, data)
     eid = str(uuid.uuid4())
     db.execute(
         text(
@@ -253,7 +276,31 @@ async def add_evidencia(
             "txt": texto,
         },
     )
+    if tipo == "IMAGEN":
+        bg.add_task(run_ai_pipeline, incidente_id, user.tenant, 0.0)
+    elif tipo == "AUDIO" and file:
+        bg.add_task(_transcribir_y_trigger, incidente_id, user.tenant, data, file.content_type or "audio/aac")
     return {"id": eid, "url": url}
+
+
+async def _transcribir_y_trigger(incidente_id: str, tenant_id: str, data: bytes, mime: str):
+    texto = None
+    try:
+        texto, _ = transcribe_audio_bytes(data, mime)
+    except Exception:
+        pass
+    from ..core.db import SessionLocal
+    db = SessionLocal()
+    try:
+        db.execute(
+            text("UPDATE emergencias.evidencia SET transcripcion = :t WHERE id = :id"),
+            {"t": texto, "id": incidente_id},
+        )
+        db.commit()
+    finally:
+        db.close()
+    from ..services.ai import run_ai_pipeline
+    await run_ai_pipeline(incidente_id, tenant_id)
 
 
 @router.get("/{incidente_id}/historial")
@@ -266,6 +313,67 @@ def historial(incidente_id: str, db=Depends(get_db)):
         {"id": incidente_id},
     ).mappings().all()
     return {"items": [dict(r) for r in rows]}
+
+
+@router.post("/{incidente_id}/calificacion", status_code=201)
+def calificar_servicio(
+    incidente_id: str,
+    body: CalificacionIn,
+    user: CurrentUser = Depends(require_roles("CONDUCTOR")),
+    db=Depends(get_db),
+):
+    inc = db.execute(
+        text(
+            """SELECT i.id, i.tenant_id, i.conductor_id, i.estado, a.taller_id
+               FROM emergencias.incidente i
+               JOIN emergencias.asignacion a ON a.incidente_id = i.id AND a.estado = 'ACEPTADO'
+               WHERE i.id = :i"""
+        ),
+        {"i": incidente_id},
+    ).mappings().first()
+    if not inc:
+        raise HTTPException(404, "Incidente no encontrado o sin taller aceptado")
+    if str(inc["conductor_id"]) != user.id:
+        raise HTTPException(403, "No puedes calificar este incidente")
+    if inc["estado"] not in {"FINALIZADO", "PAGADO"}:
+        raise HTTPException(409, "Solo se puede calificar un servicio finalizado o pagado")
+
+    cal_id = str(uuid.uuid4())
+    try:
+        db.execute(
+            text(
+                """INSERT INTO emergencias.calificacion_servicio
+                (id, tenant_id, incidente_id, taller_id, conductor_id, estrellas, comentario)
+                VALUES (:id, :t, :i, :tl, :c, :e, :comentario)"""
+            ),
+            {
+                "id": cal_id,
+                "t": str(inc["tenant_id"]),
+                "i": incidente_id,
+                "tl": str(inc["taller_id"]),
+                "c": user.id,
+                "e": body.estrellas,
+                "comentario": body.comentario,
+            },
+        )
+    except Exception as exc:
+        if "uq_calificacion_incidente" in str(exc):
+            raise HTTPException(409, "Este incidente ya fue calificado") from exc
+        raise
+
+    db.execute(
+        text(
+            """UPDATE emergencias.taller
+               SET calificacion = (
+                 SELECT ROUND(AVG(estrellas)::numeric, 2)
+                 FROM emergencias.calificacion_servicio
+                 WHERE taller_id = :tl
+               )
+               WHERE id = :tl"""
+        ),
+        {"tl": str(inc["taller_id"])},
+    )
+    return {"id": cal_id, "estrellas": body.estrellas}
 
 
 @router.post("/{incidente_id}/ubicacion")

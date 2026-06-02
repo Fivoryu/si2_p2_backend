@@ -7,6 +7,7 @@ from sqlalchemy import text
 from ..core.deps import get_db, require_roles
 from ..schemas.sync import SyncBatch
 from ..services.ai import run_ai_pipeline
+from ..services.transcription import transcribe_audio_bytes
 
 router = APIRouter(prefix="/sync", tags=["sync"])
 
@@ -103,8 +104,23 @@ def sync(
         for ev in item.evidencias:
             eid = str(uuid.uuid4())
             url = None
+            texto = ev.texto
             if ev.contenido_b64:
-                url = f"sync/{inc_id}/{eid}"
+                try:
+                    data = base64.b64decode(ev.contenido_b64)
+                    mime = ev.mime_type or "application/octet-stream"
+                    key = f"{user.tenant}/{inc_id}/{eid}"
+                    try:
+                        from ..core.aws import upload_bytes
+
+                        upload_bytes(key, data, mime)
+                        url = key
+                    except Exception:
+                        url = f"local://{key}"
+                    if ev.tipo == "AUDIO" and not ev.texto:
+                        texto = None
+                except Exception:
+                    url = f"sync/{inc_id}/{eid}"
             db.execute(
                 text(
                     """INSERT INTO emergencias.evidencia
@@ -117,9 +133,11 @@ def sync(
                     "i": inc_id,
                     "tipo": ev.tipo,
                     "url": url,
-                    "txt": ev.texto,
+                    "txt": texto,
                 },
             )
+            if ev.tipo == "AUDIO" and ev.contenido_b64:
+                bg.add_task(_transcribir_audio_sync, str(eid), ev.contenido_b64, ev.mime_type or "audio/aac")
         bg.add_task(run_ai_pipeline, inc_id, user.tenant)
         out.append(
             {
@@ -129,3 +147,21 @@ def sync(
             }
         )
     return {"results": out}
+
+
+def _transcribir_audio_sync(evidencia_id: str, contenido_b64: str, mime: str):
+    try:
+        data = base64.b64decode(contenido_b64)
+        texto, _ = transcribe_audio_bytes(data, mime)
+        from ..core.db import SessionLocal
+        db = SessionLocal()
+        try:
+            db.execute(
+                text("UPDATE emergencias.evidencia SET transcripcion = :t WHERE id = :id"),
+                {"t": texto, "id": evidencia_id},
+            )
+            db.commit()
+        finally:
+            db.close()
+    except Exception:
+        pass

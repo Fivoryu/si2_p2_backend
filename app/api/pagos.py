@@ -1,11 +1,12 @@
 import uuid
+from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import text
 
 from ..core.config import settings
-from ..core.deps import get_db, get_db_public, require_roles
+from ..core.deps import get_db, require_roles
 
 router = APIRouter(prefix="/pagos", tags=["pagos"])
 
@@ -22,11 +23,13 @@ def create_intent(
     db=Depends(get_db),
 ):
     cot = db.execute(
-        text("SELECT monto FROM emergencias.cotizacion WHERE id = :id"),
+        text("SELECT monto, estado FROM emergencias.cotizacion WHERE id = :id"),
         {"id": body.cotizacion_id},
     ).first()
     if not cot:
         raise HTTPException(404, "Cotización not found")
+    if cot[1] != "ACEPTADA":
+        raise HTTPException(409, "La cotizacion debe estar aceptada antes de pagar")
     pago_id = str(uuid.uuid4())
     client_secret = None
     if settings.stripe_secret_key:
@@ -48,8 +51,8 @@ def create_intent(
     db.execute(
         text(
             """INSERT INTO emergencias.pago
-            (id, tenant_id, incidente_id, cotizacion_id, monto, moneda, estado, metodo_pago, referencia_externa)
-            VALUES (:id, :t, :i, :c, :m, 'BOB', 'PENDIENTE', 'stripe', :ref)"""
+            (id, tenant_id, incidente_id, cotizacion_id, monto, moneda, estado, metodo, pasarela, token_transaccion)
+            VALUES (:id, :t, :i, :c, :m, 'BOB', 'PENDIENTE', 'tarjeta', 'stripe', :ref)"""
         ),
         {
             "id": pago_id,
@@ -71,17 +74,19 @@ def mock_complete(
 ):
     """Demo payment without Stripe — registers pago + factura + PAGADO."""
     cot = db.execute(
-        text("SELECT monto FROM emergencias.cotizacion WHERE id = :id"),
+        text("SELECT monto, estado FROM emergencias.cotizacion WHERE id = :id"),
         {"id": body.cotizacion_id},
     ).first()
     if not cot:
         raise HTTPException(404, "Cotización not found")
+    if cot[1] != "ACEPTADA":
+        raise HTTPException(409, "La cotizacion debe estar aceptada antes de pagar")
     pago_id = str(uuid.uuid4())
     db.execute(
         text(
             """INSERT INTO emergencias.pago
-            (id, tenant_id, incidente_id, cotizacion_id, monto, moneda, estado, metodo_pago)
-            VALUES (:id, :t, :i, :c, :m, 'BOB', 'COMPLETADO', 'mock')"""
+            (id, tenant_id, incidente_id, cotizacion_id, monto, moneda, estado, metodo, pasarela, pagado_at)
+            VALUES (:id, :t, :i, :c, :m, 'BOB', 'COMPLETADO', 'mock', 'mock', now())"""
         ),
         {
             "id": pago_id,
@@ -95,7 +100,21 @@ def mock_complete(
         text("UPDATE emergencias.incidente SET estado = 'PAGADO' WHERE id = :i"),
         {"i": body.incidente_id},
     )
-    return {"pago_id": pago_id, "estado": "COMPLETADO"}
+    numero = f"FAC-{datetime.utcnow().strftime('%Y%m%d')}-{pago_id[:8]}"
+    db.execute(
+        text(
+            """INSERT INTO emergencias.factura (tenant_id, pago_id, numero, url_pdf)
+               VALUES (:t, :p, :n, :url)
+               ON CONFLICT (pago_id) DO NOTHING"""
+        ),
+        {
+            "t": user.tenant,
+            "p": pago_id,
+            "n": numero,
+            "url": f"/facturas/{numero}.pdf",
+        },
+    )
+    return {"pago_id": pago_id, "estado": "COMPLETADO", "factura": numero}
 
 
 @router.get("/comisiones")
