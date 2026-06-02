@@ -1,22 +1,41 @@
 import asyncio
 from sqlalchemy import text
 
+from ..core.aws import download_bytes
 from ..core.db import scoped_session
 from .assignment import assign_best_workshop
+from .vision import classify_image_bytes, models_available
 
 TIPOS = {
-    "BATERIA": "33333333-0000-0000-0000-000000000001",
-    "LLANTA": "33333333-0000-0000-0000-000000000002",
-    "MOTOR": "33333333-0000-0000-0000-000000000003",
-    "CHOQUE": "33333333-0000-0000-0000-000000000004",
+    "BATERIA_CARGADOR": "33333333-0000-0000-0000-000000000001",
+    "BATERIA_DESCARGADA": "33333333-0000-0000-0000-000000000002",
+    "LLANTA_PINCHAZO": "33333333-0000-0000-0000-000000000003",
+    "MOTOR": "33333333-0000-0000-0000-000000000004",
     "OTROS": "33333333-0000-0000-0000-000000000005",
+    "LLANTA_PRESION": "33333333-0000-0000-0000-000000000006",
+    "FRENOS": "33333333-0000-0000-0000-000000000007",
+    "SUSPENSION": "33333333-0000-0000-0000-000000000008",
+    "AIRBAG": "33333333-0000-0000-0000-000000000009",
+    "COLISION_DENT": "33333333-0000-0000-0000-000000000010",
+    "COLISION_SCRATCH": "33333333-0000-0000-0000-000000000011",
+    "COLISION_CRAK": "33333333-0000-0000-0000-000000000012",
+    "VIDRIOS_LUCES": "33333333-0000-0000-0000-000000000013",
 }
 
 KEYWORDS = {
-    "BATERIA": ["bateria", "no arranca", "descargada", "arranque"],
-    "LLANTA": ["llanta", "pinchazo", "neumatico", "rueda"],
-    "MOTOR": ["motor", "humo", "sobrecalent", "falla mecanica"],
-    "CHOQUE": ["choque", "colision", "accidente", "golpe"],
+    "BATERIA_CARGADOR": ["cargador", "alternador", "no carga"],
+    "BATERIA_DESCARGADA": ["bateria", "descargada", "arranque", "no enciende"],
+    "LLANTA_PRESION": ["presion", "inflar", "baja presion"],
+    "LLANTA_PINCHAZO": ["llanta", "pinchazo", "neumático", "rueda", "flat"],
+    "FRENOS": ["frenos", "freno", "brake", "sistema frenado"],
+    "MOTOR": ["motor", "humo", "sobrecalent", "falla mecanica", "engine"],
+    "SUSPENSION": ["suspension", "amortigu", "ESP"],
+    "AIRBAG": ["airbag", "srs", "cinturon"],
+    "COLISION_DENT": ["diente", "abolladura", "dent"],
+    "COLISION_SCRATCH": ["rayadura", "scratch", "arañazo"],
+    "COLISION_CRAK": ["grieta", "crack", "quebrado"],
+    "VIDRIOS_LUCES": ["vidrio", "cristal", "lampara", "luz rota", "glass", "lamp"],
+    "OTROS": ["emergencia", "otro", "problema"],
 }
 
 
@@ -42,10 +61,18 @@ def fuse(text_res, img_res) -> tuple[str, float]:
 
 def priority_for(codigo: str, texto: str) -> str:
     base = {
-        "CHOQUE": "ALTA",
+        "COLISION_DENT": "ALTA",
+        "COLISION_SCRATCH": "ALTA",
+        "COLISION_CRAK": "ALTA",
+        "VIDRIOS_LUCES": "ALTA",
         "MOTOR": "ALTA",
-        "BATERIA": "MEDIA",
-        "LLANTA": "MEDIA",
+        "FRENOS": "ALTA",
+        "AIRBAG": "ALTA",
+        "BATERIA_CARGADOR": "MEDIA",
+        "BATERIA_DESCARGADA": "MEDIA",
+        "LLANTA_PRESION": "MEDIA",
+        "LLANTA_PINCHAZO": "MEDIA",
+        "SUSPENSION": "MEDIA",
     }.get(codigo, "BAJA")
     if any(
         w in (texto or "").lower()
@@ -62,8 +89,9 @@ def summarize(inc: dict, transcripcion: str) -> str:
     )
 
 
-async def run_ai_pipeline(incidente_id: str, tenant_id: str):
-    await asyncio.sleep(0.1)
+async def run_ai_pipeline(incidente_id: str, tenant_id: str, delay_s: float = 0.0):
+    if delay_s > 0:
+        await asyncio.sleep(delay_s)
     db = scoped_session(tenant_id)
     try:
         inc = db.execute(
@@ -80,8 +108,12 @@ async def run_ai_pipeline(incidente_id: str, tenant_id: str):
 
         transcripcion = ""
         for e in evs:
-            if e["tipo"] == "AUDIO" and e.get("transcripcion"):
-                transcripcion = e["transcripcion"]
+            if e["tipo"] == "AUDIO":
+                transcripcion = (
+                    e.get("transcripcion")
+                    or e.get("contenido_texto")
+                    or transcripcion
+                )
             elif e["tipo"] == "TEXTO" and e.get("contenido_texto"):
                 transcripcion = e["contenido_texto"]
 
@@ -89,7 +121,16 @@ async def run_ai_pipeline(incidente_id: str, tenant_id: str):
         text_res = classify_text(texto)
         img_res = None
         for e in evs:
-            if e["tipo"] == "IMAGEN":
+            if e["tipo"] != "IMAGEN":
+                continue
+            url = e.get("url") or ""
+            if models_available() and url and not url.startswith("sync/"):
+                key = url.replace("local://", "")
+                data = download_bytes(key)
+                if data:
+                    img_res = classify_image_bytes(data)
+                    break
+            if img_res is None and e.get("contenido_texto"):
                 img_res = classify_text(e.get("contenido_texto") or texto)
                 break
 
@@ -103,7 +144,7 @@ async def run_ai_pipeline(incidente_id: str, tenant_id: str):
                 """INSERT INTO emergencias.clasificacion_ia
                 (tenant_id, incidente_id, fuente, tipo_incidente_id, etiqueta, confianza,
                  prioridad_sugerida, modelo)
-                VALUES (:t, :i, 'COMBINADA', :tp, :lbl, :c, :p, 'keywords')"""
+                VALUES (:t, :i, 'COMBINADA', :tp, :lbl, :c, :p, :m)"""
             ),
             {
                 "t": tenant_id,
@@ -112,6 +153,7 @@ async def run_ai_pipeline(incidente_id: str, tenant_id: str):
                 "lbl": codigo,
                 "c": conf,
                 "p": prio,
+                "m": "yolov8-dashboard+cardd" if models_available() else "keywords",
             },
         )
         db.execute(
