@@ -7,9 +7,11 @@ from .api import (
     asignaciones,
     auth,
     cotizaciones,
+    ia,
     incidentes,
     kpi,
     pagos,
+    public,
     sync,
     talleres,
     tecnicos,
@@ -46,7 +48,9 @@ def health():
 
 
 for r in (
+    public,
     auth,
+    ia,
     usuarios,
     vehiculos,
     talleres,

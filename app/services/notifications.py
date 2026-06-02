@@ -3,6 +3,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..core.config import settings
+from ..core.db import scoped_session
 
 
 async def send_push(token: str, title: str, body: str, data: dict | None = None):
@@ -73,3 +74,48 @@ async def notify_incident_users(
             titulo=title,
             mensaje=body,
         )
+
+
+async def notify_workshop_new_assignment(
+    tenant_id: str, taller_id: str, incidente_id: str, taller_nombre: str
+):
+    db = scoped_session(tenant_id)
+    try:
+        row = db.execute(
+            text(
+                """SELECT u.fcm_token, u.id AS usuario_id
+                FROM emergencias.usuario u
+                JOIN emergencias.taller t ON t.usuario_id = u.id
+                WHERE t.id = :tid"""
+            ),
+            {"tid": taller_id},
+        ).mappings().first()
+
+        if not row:
+            return
+
+        fcm_token: str | None = row.get("fcm_token")
+        usuario_id = str(row["usuario_id"])
+
+        title = "Nueva solicitud de auxilio"
+        body = f"Tienes una nueva emergencia asignada: {taller_nombre}"
+        data = {"incidente_id": incidente_id, "taller_id": taller_id}
+
+        if fcm_token:
+            await send_push(fcm_token, title, body, data)
+
+        save_notification(
+            db,
+            tenant_id=tenant_id,
+            usuario_id=usuario_id,
+            incidente_id=incidente_id,
+            titulo=title,
+            mensaje=body,
+            canal="PUSH",
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()

@@ -2,6 +2,7 @@ from . import (
     asignaciones,
     auth,
     cotizaciones,
+    ia,
     incidentes,
     kpi,
     pagos,

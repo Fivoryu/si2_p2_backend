@@ -1,8 +1,11 @@
 from functools import lru_cache
+from pathlib import Path
 
 import boto3
 
 from .config import settings
+
+LOCAL_EVIDENCIAS_DIR = Path(__file__).resolve().parents[2] / "data" / "evidencias"
 
 
 def _client_kwargs(public: bool = False) -> dict:
@@ -48,3 +51,25 @@ def presigned_url(key: str, expires: int = 3600) -> str:
         Params={"Bucket": settings.s3_bucket_evidencias, "Key": key},
         ExpiresIn=expires,
     )
+
+
+def save_local_evidencia(key: str, data: bytes) -> str:
+    path = LOCAL_EVIDENCIAS_DIR / key
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return f"local://{key}"
+
+
+def download_bytes(key: str) -> bytes | None:
+    """Descarga evidencia por clave S3 o almacenamiento local de respaldo."""
+    local = LOCAL_EVIDENCIAS_DIR / key
+    if local.exists():
+        return local.read_bytes()
+    try:
+        obj = _s3_internal().get_object(
+            Bucket=settings.s3_bucket_evidencias,
+            Key=key,
+        )
+        return obj["Body"].read()
+    except Exception:
+        return None
