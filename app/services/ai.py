@@ -23,7 +23,16 @@ TIPOS = {
 }
 
 KEYWORDS = {
-    "BATERIA_CARGADOR": ["cargador", "alternador", "no carga"],
+    "BATERIA_CARGADOR": [
+        "cargador",
+        "alternador",
+        "no carga",
+        "battery",
+        "weak lights",
+        "lights are weak",
+        "wont start",
+        "won't start",
+    ],
     "BATERIA_DESCARGADA": ["bateria", "descargada", "arranque", "no enciende"],
     "LLANTA_PRESION": ["presion", "inflar", "baja presion"],
     "LLANTA_PINCHAZO": ["llanta", "pinchazo", "neumático", "rueda", "flat"],

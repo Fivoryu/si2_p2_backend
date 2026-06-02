@@ -384,7 +384,7 @@ class TestFlujoCompletoE2E:
             assert row is not None
             estado = row[0]
             assert estado in ("BUSCANDO_TALLER", "TALLER_ASIGNADO", "EN_CAMINO"), f"Got: {estado}"
-            assert row[1] == TIPO_BATERIA
+            assert str(row[1]) == TIPO_BATERIA
             assert row[2] == "MEDIA"
 
             if estado == "TALLER_ASIGNADO":
