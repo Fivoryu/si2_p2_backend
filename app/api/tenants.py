@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import text
 
-from ..core.deps import get_db, require_roles
+from ..core.deps import CurrentUser, get_current_user, get_db, require_roles
 from ..core.security import hash_password
 
 router = APIRouter(prefix="/tenants", tags=["tenants"])
@@ -23,6 +23,26 @@ class TenantAdminIn(BaseModel):
 
 class PlanPatch(BaseModel):
     plan_id: str
+
+
+@router.get("")
+def list_tenants(
+    db=Depends(get_db),
+):
+    rows = db.execute(
+        text("SELECT id, nombre, dominio, plan_id FROM emergencias.tenant ORDER BY nombre")
+    ).mappings().all()
+    return {"items": [dict(r) for r in rows]}
+
+
+@router.get("/planes")
+def list_plans(
+    db=Depends(get_db),
+):
+    rows = db.execute(
+        text("SELECT id, nombre FROM emergencias.plan ORDER BY nombre")
+    ).mappings().all()
+    return {"items": [dict(r) for r in rows]}
 
 
 @router.post("", status_code=201)

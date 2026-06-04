@@ -130,7 +130,10 @@ class SlaIn(BaseModel):
 
 
 @router.get("/sla")
-def list_sla(db=Depends(get_db)):
+def list_sla(
+    user: CurrentUser = Depends(require_roles("ADMIN_PLATAFORMA", "ADMIN_TENANT")),
+    db=Depends(get_db),
+):
     rows = db.execute(text("SELECT * FROM emergencias.sla_config")).mappings().all()
     return [dict(r) for r in rows]
 
@@ -158,3 +161,25 @@ def create_sla(
         },
     )
     return {"id": sid}
+
+
+class SlaPatch(BaseModel):
+    tiempo_max_min: int
+
+
+@router.patch("/sla/{sla_id}")
+def patch_sla(
+    sla_id: str,
+    body: SlaPatch,
+    user: CurrentUser = Depends(require_roles("ADMIN_PLATAFORMA", "ADMIN_TENANT")),
+    db=Depends(get_db),
+):
+    db.execute(
+        text(
+            """UPDATE emergencias.sla_config
+            SET tiempo_max_min = :tm, updated_at = now()
+            WHERE id = :id"""
+        ),
+        {"tm": body.tiempo_max_min, "id": sla_id},
+    )
+    return {"ok": True}
