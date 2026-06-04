@@ -6,6 +6,22 @@ from ..core.config import settings
 from ..core.db import scoped_session
 
 
+ESTADO_NOTIFICATIONS = {
+    "EN_CAMINO": (
+        "Técnico en camino",
+        "El técnico está dirigiéndose a tu ubicación. ¡Estamos en camino!",
+    ),
+    "EN_ATENCION": (
+        "Técnico llegó",
+        "El técnico ha llegado al lugar del incidente y está atendiendo tu vehículo.",
+    ),
+    "FINALIZADO": (
+        "Servicio finalizado",
+        "El servicio ha sido completado. Por favor califica la atención recibida.",
+    ),
+}
+
+
 async def send_push(token: str, title: str, body: str, data: dict | None = None):
     if not settings.fcm_server_key or not token:
         return
@@ -57,9 +73,10 @@ async def notify_incident_users(
 ):
     rows = db.execute(
         text(
-            """SELECT u.id, u.fcm_token FROM emergencias.usuario u
-            JOIN emergencias.incidente i ON i.conductor_id = u.id OR i.id = :inc
-            WHERE i.id = :inc AND u.fcm_token IS NOT NULL"""
+            """SELECT u.id, u.fcm_token
+               FROM emergencias.incidente i
+               JOIN emergencias.usuario u ON u.id = i.conductor_id
+               WHERE i.id = :inc"""
         ),
         {"inc": incidente_id},
     ).mappings().all()
@@ -119,3 +136,60 @@ async def notify_workshop_new_assignment(
         raise
     finally:
         db.close()
+
+
+async def notify_estado_change(
+    db: Session,
+    tenant_id: str,
+    incidente_id: str,
+    estado_anterior: str,
+    estado_nuevo: str,
+):
+    if estado_nuevo not in ESTADO_NOTIFICATIONS:
+        return
+
+    title, body = ESTADO_NOTIFICATIONS[estado_nuevo]
+    await notify_incident_users(db, tenant_id, incidente_id, title, body)
+
+
+async def notify_workshop_status_change(
+    db: Session,
+    tenant_id: str,
+    taller_id: str,
+    estado_nuevo: str,
+    incidente_id: str,
+):
+    if estado_nuevo not in ESTADO_NOTIFICATIONS:
+        return
+
+    title, body = ESTADO_NOTIFICATIONS[estado_nuevo]
+    title = f"[{title}]"
+
+    row = db.execute(
+        text(
+            """SELECT u.fcm_token, u.id AS usuario_id
+            FROM emergencias.usuario u
+            JOIN emergencias.taller t ON t.usuario_id = u.id
+            WHERE t.id = :tid"""
+        ),
+        {"tid": taller_id},
+    ).mappings().first()
+
+    if not row:
+        return
+
+    fcm_token: str | None = row.get("fcm_token")
+    usuario_id = str(row["usuario_id"])
+
+    if fcm_token:
+        await send_push(fcm_token, title, body, {"incidente_id": incidente_id})
+
+    save_notification(
+        db,
+        tenant_id=tenant_id,
+        usuario_id=usuario_id,
+        incidente_id=incidente_id,
+        titulo=title,
+        mensaje=body,
+        canal="PUSH",
+    )

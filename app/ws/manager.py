@@ -1,5 +1,6 @@
 import asyncio
 import json
+import uuid
 from collections import defaultdict
 
 import redis.asyncio as aioredis
@@ -19,6 +20,7 @@ class WSManager:
         self.pubsub = self.redis.pubsub()
         self._listener_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        self.instance_id = str(uuid.uuid4())
 
     async def connect(self, ws: WebSocket, tenant_id: str, incident_id: str):
         await ws.accept()
@@ -41,23 +43,82 @@ class WSManager:
                     pass
 
     async def publish(self, tenant_id: str, incident_id: str, event: dict):
-        await self.redis.publish(
-            channel(tenant_id, incident_id), json.dumps(event, default=str)
-        )
+        ch = channel(tenant_id, incident_id)
+        await self._broadcast_local(ch, event)
+        payload = dict(event)
+        payload["_origin"] = self.instance_id
+        await self.redis.publish(ch, json.dumps(payload, default=str))
+
+    async def _broadcast_local(self, ch: str, event: dict):
+        dead = []
+        payload = json.dumps(event, default=str)
+        for ws in list(self.local.get(ch, [])):
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.local[ch].discard(ws)
+
+    async def broadcast_state_snapshot(
+        self, tenant_id: str, incident_id: str, incident_data: dict
+    ):
+        await self.publish(tenant_id, incident_id, {
+            "type": "STATE_SNAPSHOT",
+            "incident_id": incident_id,
+            "data": incident_data,
+        })
+
+    async def broadcast_status_changed(
+        self,
+        tenant_id: str,
+        incident_id: str,
+        estado_anterior: str,
+        estado_nuevo: str,
+        comentario: str | None = None,
+    ):
+        await self.publish(tenant_id, incident_id, {
+            "type": "STATUS_CHANGED",
+            "incident_id": incident_id,
+            "data": {
+                "estado_anterior": estado_anterior,
+                "estado_nuevo": estado_nuevo,
+                "comentario": comentario,
+            },
+        })
+
+    async def broadcast_tech_location(
+        self,
+        tenant_id: str,
+        incident_id: str,
+        lat: float,
+        lng: float,
+        tecnico_id: str | None = None,
+    ):
+        await self.publish(tenant_id, incident_id, {
+            "type": "TECH_LOCATION",
+            "incident_id": incident_id,
+            "data": {"lat": lat, "lng": lng, "tecnico_id": tecnico_id},
+        })
+
+    async def broadcast_tech_arrived(
+        self, tenant_id: str, incident_id: str, lat: float, lng: float
+    ):
+        await self.publish(tenant_id, incident_id, {
+            "type": "TECH_ARRIVED",
+            "incident_id": incident_id,
+            "data": {"lat": lat, "lng": lng},
+        })
 
     async def _listen(self):
         async for msg in self.pubsub.listen():
             if msg["type"] != "message":
                 continue
             ch, payload = msg["channel"], msg["data"]
-            dead = []
-            for ws in list(self.local.get(ch, [])):
-                try:
-                    await ws.send_text(payload)
-                except Exception:
-                    dead.append(ws)
-            for ws in dead:
-                self.local[ch].discard(ws)
+            event = json.loads(payload)
+            if event.pop("_origin", None) == self.instance_id:
+                continue
+            await self._broadcast_local(ch, event)
 
 
 manager = WSManager()

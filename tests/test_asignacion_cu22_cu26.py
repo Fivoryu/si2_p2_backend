@@ -417,6 +417,6 @@ class TestFlujoCompletoE2E:
                     text("SELECT tecnico_id FROM emergencias.asignacion WHERE id = :id"),
                     {"id": asig[0]},
                 ).first()[0]
-                assert tecnico == TECNICO_ID
+                assert str(tecnico) == TECNICO_ID
         finally:
             cleanup_incidente(inc_id)

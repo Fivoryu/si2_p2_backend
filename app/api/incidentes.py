@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import uuid
 from datetime import datetime, timezone
@@ -6,6 +7,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPExcepti
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
+from ..core.db import scoped_session
 from ..core.deps import CurrentUser, get_current_user, get_db, require_roles
 from ..core.state_machine import CANCELABLE, can_transition
 from ..schemas.incidente import (
@@ -13,9 +15,17 @@ from ..schemas.incidente import (
     EstadoPatch,
     IncidenteCreate,
     IncidenteOut,
+    SimularIn,
     UbicacionIn,
 )
 from ..services.ai import run_ai_pipeline
+from ..services.notifications import notify_estado_change
+from ..services.routing import (
+    es_geocerca_cercana,
+    generar_ruta_fake,
+    interpolar_punto,
+    obtener_ruta,
+)
 from ..services.transcription import transcribe_audio_bytes
 from ..ws.manager import manager
 
@@ -25,6 +35,38 @@ router = APIRouter(prefix="/incidentes", tags=["incidentes"])
 class CalificacionIn(BaseModel):
     estrellas: int = Field(ge=1, le=5)
     comentario: str | None = None
+
+
+def _can_manage_incident_service(db, incidente_id: str, user: CurrentUser) -> bool:
+    if user.rol == "ADMIN_TENANT":
+        return True
+    if user.rol == "TALLER":
+        row = db.execute(
+            text(
+                """SELECT 1
+                   FROM emergencias.asignacion a
+                   JOIN emergencias.taller t ON t.id = a.taller_id
+                   WHERE a.incidente_id = :i
+                     AND a.estado = 'ACEPTADO'
+                     AND t.usuario_id = :u"""
+            ),
+            {"i": incidente_id, "u": user.id},
+        ).first()
+        return row is not None
+    if user.rol == "TECNICO":
+        row = db.execute(
+            text(
+                """SELECT 1
+                   FROM emergencias.asignacion a
+                   JOIN emergencias.tecnico tec ON tec.id = a.tecnico_id
+                   WHERE a.incidente_id = :i
+                     AND a.estado = 'ACEPTADO'
+                     AND tec.usuario_id = :u"""
+            ),
+            {"i": incidente_id, "u": user.id},
+        ).first()
+        return row is not None
+    return False
 
 
 def _row_to_out(row) -> IncidenteOut:
@@ -174,6 +216,8 @@ async def patch_estado(
     ).mappings().first()
     if not inc:
         raise HTTPException(404, "Not found")
+    if not _can_manage_incident_service(db, incidente_id, user):
+        raise HTTPException(403, "Forbidden for this incident")
     old = inc["estado"]
     if not can_transition(old, body.estado):
         raise HTTPException(409, f"Invalid transition {old} -> {body.estado}")
@@ -207,6 +251,7 @@ async def patch_estado(
                 "data": {},
             },
         )
+    await notify_estado_change(db, tenant, incidente_id, old, body.estado)
     return {"estado": body.estado}
 
 
@@ -389,11 +434,13 @@ async def post_ubicacion(
     ).mappings().first()
     if not inc:
         raise HTTPException(404, "Not found")
+    if not _can_manage_incident_service(db, incidente_id, user):
+        raise HTTPException(403, "Forbidden for this incident")
     db.execute(
         text(
             """INSERT INTO emergencias.ubicacion_tracking
-            (tenant_id, incidente_id, latitud, longitud, tecnico_id)
-            VALUES (:t, :i, :la, :lo, :tec)"""
+            (tenant_id, incidente_id, latitud, longitud, tecnico_id, es_fake)
+            VALUES (:t, :i, :la, :lo, :tec, :fake)"""
         ),
         {
             "t": str(inc["tenant_id"]),
@@ -401,6 +448,7 @@ async def post_ubicacion(
             "la": body.lat,
             "lo": body.lng,
             "tec": body.tecnico_id or user.id,
+            "fake": body.es_fake,
         },
     )
     tenant = str(inc["tenant_id"])
@@ -415,3 +463,115 @@ async def post_ubicacion(
         },
     )
     return {"ok": True}
+
+
+@router.post("/{incidente_id}/simular")
+async def simular_ruta(
+    incidente_id: str,
+    body: SimularIn = None,
+    user: CurrentUser = Depends(require_roles("TALLER", "ADMIN_TENANT")),
+    db=Depends(get_db),
+):
+    if body is None:
+        body = SimularIn()
+
+    inc = db.execute(
+        text(
+            """SELECT i.tenant_id, i.latitud, i.longitud, i.estado,
+                      t.latitud AS t_lat, t.longitud AS t_lng,
+                      a.tecnico_id
+               FROM emergencias.incidente i
+               JOIN emergencias.asignacion a ON a.incidente_id = i.id AND a.estado = 'ACEPTADO'
+               JOIN emergencias.taller t ON t.id = a.taller_id
+               WHERE i.id = :id"""
+        ),
+        {"id": incidente_id},
+    ).mappings().first()
+    if not inc:
+        raise HTTPException(404, "Incidente no encontrado o sin asignación aceptada")
+    if not _can_manage_incident_service(db, incidente_id, user):
+        raise HTTPException(403, "Forbidden for this incident")
+    if inc["estado"] not in {"TALLER_ASIGNADO", "EN_CAMINO"}:
+        raise HTTPException(409, "El incidente debe estar asignado o en camino")
+
+    if inc["latitud"] is None or inc["longitud"] is None:
+        raise HTTPException(409, "El incidente no tiene coordenadas de destino")
+    if inc["t_lat"] is None or inc["t_lng"] is None:
+        raise HTTPException(409, "El taller no tiene coordenadas")
+
+    origen = (float(inc["t_lng"]), float(inc["t_lat"]))
+    destino = (float(inc["longitud"]), float(inc["latitud"]))
+
+    ruta = generar_ruta_fake(origen, destino, num_puntos=60)
+
+    bg_tasks: list[asyncio.Task] = []
+
+    async def _enviar_punto(lon: float, lat: float, fake: bool):
+        db2 = scoped_session(str(inc["tenant_id"]))
+        try:
+            db2.execute(
+                text(
+                    """INSERT INTO emergencias.ubicacion_tracking
+                    (tenant_id, incidente_id, latitud, longitud, tecnico_id, es_fake)
+                    VALUES (:t, :i, :la, :lo, :tec, :fake)"""
+                ),
+                {
+                    "t": str(inc["tenant_id"]),
+                    "i": incidente_id,
+                    "la": lat,
+                    "lo": lon,
+                    "tec": str(inc["tecnico_id"]) if inc.get("tecnico_id") else None,
+                    "fake": fake,
+                },
+            )
+            db2.commit()
+        finally:
+            db2.close()
+
+        await manager.broadcast_tech_location(
+            str(inc["tenant_id"]),
+            incidente_id,
+            lat=lat,
+            lng=lon,
+            tecnico_id=str(inc["tecnico_id"]) if inc.get("tecnico_id") else None,
+        )
+
+    async def _simular():
+        coords = ruta.coords
+        num_puntos = len(coords)
+        intervalo = body.intervalo_seg
+        velocidad = body.velocidad_kmh
+
+        for idx in range(0, num_puntos, max(1, num_puntos // 30)):
+            lon, lat = coords[idx]
+            await _enviar_punto(lon, lat, body.usar_fake)
+
+            pos_actual = (lon, lat)
+            if es_geocerca_cercana(pos_actual, destino, radio_m=50):
+                await manager.broadcast_tech_arrived(
+                    str(inc["tenant_id"]),
+                    incidente_id,
+                    lat=lat,
+                    lng=lon,
+                )
+                db3 = scoped_session(str(inc["tenant_id"]))
+                try:
+                    db3.execute(
+                        text(
+                            "UPDATE emergencias.incidente SET estado = 'EN_ATENCION' WHERE id = :id"
+                        ),
+                        {"id": incidente_id},
+                    )
+                    db3.commit()
+                    await notify_estado_change(
+                        db3, str(inc["tenant_id"]), incidente_id, "EN_CAMINO", "EN_ATENCION"
+                    )
+                finally:
+                    db3.close()
+                break
+
+            await asyncio.sleep(intervalo)
+
+    task = asyncio.create_task(_simular())
+    bg_tasks.append(task)
+    return {"ok": True, "mensaje": "Simulación iniciada", "puntos": len(ruta.coords)}

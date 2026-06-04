@@ -42,3 +42,10 @@ class UbicacionIn(BaseModel):
     lat: float
     lng: float
     tecnico_id: str | None = None
+    es_fake: bool = False
+
+
+class SimularIn(BaseModel):
+    velocidad_kmh: float = 40.0
+    usar_fake: bool = True
+    intervalo_seg: float = 3.0
