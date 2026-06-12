@@ -122,48 +122,62 @@ async def plan_webhook(request: Request):
         raise HTTPException(404, "Signup session expired or already processed")
     data = json.loads(data_raw)
 
-    # 4. Create tenant + admin user with must_change_password
+    # 4. Create tenant + admin user, or update existing user
     db = next(get_db_public())
+    temp_password = secrets.token_urlsafe(12)
+    tid = None
     try:
-        existing = db.execute(
-            text("SELECT id FROM emergencias.usuario WHERE email = :e LIMIT 1"),
+        existing_user = db.execute(
+            text("SELECT id, tenant_id FROM emergencias.usuario WHERE email = :e LIMIT 1"),
             {"e": data["admin_email"].lower()},
-        ).first()
-        if existing:
-            raise HTTPException(409, "Email already registered")
+        ).mappings().first()
 
-        tid = str(uuid.uuid4())
-        uid = str(uuid.uuid4())
-        temp_password = secrets.token_urlsafe(12)
+        if existing_user:
+            # Email already registered → update password + force change
+            uid = str(existing_user["id"])
+            tid = str(existing_user["tenant_id"])
+            db.execute(
+                text(
+                    """UPDATE emergencias.usuario
+                    SET password_hash = :ph, must_change_password = TRUE
+                    WHERE id = :id"""
+                ),
+                {"ph": hash_password(temp_password), "id": uid},
+            )
+            db.commit()
+        else:
+            # New user → create tenant + admin
+            tid = str(uuid.uuid4())
+            uid = str(uuid.uuid4())
 
-        db.execute(
-            text(
-                """INSERT INTO emergencias.tenant (id, nombre, dominio, plan_id)
-                VALUES (:id, :n, :d, :p)"""
-            ),
-            {
-                "id": tid,
-                "n": data["org_nombre"],
-                "d": data["dominio"] or None,
-                "p": data["plan_id"],
-            },
-        )
-        db.execute(
-            text(
-                """INSERT INTO emergencias.usuario
-                (id, tenant_id, rol, nombre, email, password_hash,
-                 email_verificado, must_change_password)
-                VALUES (:id, :t, 'ADMIN_TENANT', :n, :e, :ph, TRUE, TRUE)"""
-            ),
-            {
-                "id": uid,
-                "t": tid,
-                "n": data["admin_nombre"],
-                "e": data["admin_email"].lower(),
-                "ph": hash_password(temp_password),
-            },
-        )
-        db.commit()
+            db.execute(
+                text(
+                    """INSERT INTO emergencias.tenant (id, nombre, dominio, plan_id)
+                    VALUES (:id, :n, :d, :p)"""
+                ),
+                {
+                    "id": tid,
+                    "n": data["org_nombre"],
+                    "d": data["dominio"] or None,
+                    "p": data["plan_id"],
+                },
+            )
+            db.execute(
+                text(
+                    """INSERT INTO emergencias.usuario
+                    (id, tenant_id, rol, nombre, email, password_hash,
+                     email_verificado, must_change_password)
+                    VALUES (:id, :t, 'ADMIN_TENANT', :n, :e, :ph, TRUE, TRUE)"""
+                ),
+                {
+                    "id": uid,
+                    "t": tid,
+                    "n": data["admin_nombre"],
+                    "e": data["admin_email"].lower(),
+                    "ph": hash_password(temp_password),
+                },
+            )
+            db.commit()
 
         # 5. Send email with temp password
         send_temp_password_email(
