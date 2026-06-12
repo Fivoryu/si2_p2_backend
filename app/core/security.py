@@ -16,7 +16,14 @@ def verify_password(p: str, h: str) -> bool:
     return pwd.verify(p, h)
 
 
-def create_access_token(*, sub: str, rol: str, tenant: str | None, jti: str) -> str:
+def create_access_token(
+    *,
+    sub: str,
+    rol: str,
+    tenant: str | None,
+    jti: str,
+    must_change_password: bool = False,
+) -> str:
     now = datetime.now(timezone.utc)
     payload = {
         "sub": sub,
@@ -25,6 +32,7 @@ def create_access_token(*, sub: str, rol: str, tenant: str | None, jti: str) -> 
         "jti": jti,
         "iat": now,
         "exp": now + timedelta(minutes=settings.access_token_minutes),
+        "must_change_password": must_change_password,
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 

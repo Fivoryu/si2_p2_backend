@@ -5,10 +5,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import text
 
 from ..core.config import settings
-from ..core.deps import CurrentUser, get_current_user, get_db, get_db_public
+from ..core.deps import CurrentUser, get_current_user, get_current_user_verified, get_db, get_db_public
 from ..core.helpers import audit
 from ..core.security import create_access_token, hash_password, verify_password
 from ..schemas.auth import (
+    ChangePasswordIn,
     ForgotPasswordIn,
     LoginIn,
     LoginOut,
@@ -53,7 +54,7 @@ def register(body: RegisterIn, db=Depends(get_db_public)):
 @router.post("/login", response_model=LoginOut)
 def login(body: LoginIn, db=Depends(get_db_public)):
     params = {"e": body.email.lower()}
-    sql = """SELECT id, tenant_id, rol, password_hash, activo
+    sql = """SELECT id, tenant_id, rol, password_hash, activo, must_change_password
              FROM emergencias.usuario WHERE email = :e"""
     if body.tenant_id:
         sql += " AND tenant_id = :t"
@@ -65,11 +66,13 @@ def login(body: LoginIn, db=Depends(get_db_public)):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "user disabled")
 
     jti = str(uuid.uuid4())
+    must_change = user.get("must_change_password", False)
     token = create_access_token(
         sub=str(user["id"]),
         rol=user["rol"],
         tenant=str(user["tenant_id"]) if user["tenant_id"] else None,
         jti=jti,
+        must_change_password=must_change,
     )
     db.execute(
         text("UPDATE emergencias.usuario SET ultimo_acceso = now() WHERE id = :id"),
@@ -88,6 +91,7 @@ def login(body: LoginIn, db=Depends(get_db_public)):
         rol=user["rol"],
         tenant_id=str(user["tenant_id"]) if user["tenant_id"] else None,
         usuario_id=str(user["id"]),
+        must_change_password=must_change,
     )
 
 
@@ -157,4 +161,36 @@ def reset_password(body: ResetPasswordIn, db=Depends(get_db_public)):
     db.execute(
         text("UPDATE emergencias.token_recuperacion SET usado = true WHERE id = :id"),
         {"id": matched["id"]},
+    )
+
+
+@router.post("/change-password", status_code=204)
+def change_password(
+    body: ChangePasswordIn,
+    user: CurrentUser = Depends(get_current_user_verified),
+    db=Depends(get_db),
+):
+    row = db.execute(
+        text("SELECT password_hash FROM emergencias.usuario WHERE id = :id"),
+        {"id": user.id},
+    ).mappings().first()
+    if not row or not verify_password(body.password_actual, row["password_hash"]):
+        raise HTTPException(401, "Contraseña actual incorrecta")
+    if len(body.password_nueva) < 8:
+        raise HTTPException(400, "La nueva contraseña debe tener al menos 8 caracteres")
+    db.execute(
+        text(
+            """UPDATE emergencias.usuario
+            SET password_hash = :ph, must_change_password = FALSE
+            WHERE id = :id"""
+        ),
+        {"ph": hash_password(body.password_nueva), "id": user.id},
+    )
+    audit(
+        db,
+        tenant_id=user.tenant,
+        usuario_id=user.id,
+        accion="CHANGE_PASSWORD",
+        entidad="usuario",
+        entidad_id=user.id,
     )

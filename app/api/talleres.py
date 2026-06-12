@@ -1,11 +1,14 @@
 import uuid
+import secrets
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import text
 
-from ..core.deps import CurrentUser, get_current_user, get_db, require_roles
+from ..core.deps import CurrentUser, get_current_user_verified, get_db, require_permission
 from ..core.security import hash_password
+from ..services.email import send_temp_password_email
+from ..services.pricing import pricing_as_dict
 
 router = APIRouter(prefix="/talleres", tags=["talleres"])
 
@@ -81,28 +84,31 @@ def _assert_taller_access(db, user: CurrentUser, taller_id: str) -> None:
 
 @router.get("")
 def list_talleres(
-    user: CurrentUser = Depends(get_current_user),  # noqa: ARG001
-    db=Depends(get_db),
+    tupla=Depends(require_permission("taller", "leer")),
 ):
+    user, perm, db = tupla
     rows = db.execute(
         text("SELECT * FROM emergencias.taller ORDER BY nombre"),
     ).mappings().all()
-    return {"items": [dict(r) for r in rows], "total": len(rows)}
+    items = perm.filter_list("taller", [dict(r) for r in rows])
+    return {"items": items, "total": len(items)}
 
 
 @router.post("", status_code=201)
 def create_taller(
     body: TallerCreate,
-    user: CurrentUser = Depends(require_roles("ADMIN_TENANT")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("taller", "crear")),
 ):
+    user, perm, db = tupla
+    assert_tenant_can_create_workshop(db, user.tenant)
     uid = str(uuid.uuid4())
     tid = str(uuid.uuid4())
+    temp_password = secrets.token_urlsafe(12)
     db.execute(
         text(
             """INSERT INTO emergencias.usuario
-            (id, tenant_id, rol, nombre, email, telefono, password_hash, email_verificado)
-            VALUES (:id, :t, 'TALLER', :n, :e, :tel, :ph, true)"""
+            (id, tenant_id, rol, nombre, email, telefono, password_hash, email_verificado, must_change_password)
+            VALUES (:id, :t, 'TALLER', :n, :e, :tel, :ph, true, true)"""
         ),
         {
             "id": uid,
@@ -110,7 +116,7 @@ def create_taller(
             "n": body.nombre,
             "e": body.email.lower(),
             "tel": body.telefono,
-            "ph": hash_password("password123"),
+            "ph": hash_password(temp_password),
         },
     )
     db.execute(
@@ -132,16 +138,17 @@ def create_taller(
         },
     )
     _seed_default_especialidades(db, user.tenant, tid)
-    return {"id": tid, "usuario_id": uid}
+    send_temp_password_email(body.email.lower(), body.nombre, temp_password)
+    return {"id": tid, "usuario_id": uid, "password_temporal": temp_password}
 
 
 @router.patch("/{taller_id}/disponibilidad")
 def set_disponibilidad(
     taller_id: str,
     body: DisponibilidadIn,
-    user: CurrentUser = Depends(require_roles("TALLER", "ADMIN_TENANT")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("taller", "actualizar")),
 ):
+    user, perm, db = tupla
     sql = "UPDATE emergencias.taller SET disponible = :d"
     params = {"d": body.disponible, "id": taller_id}
     if body.capacidad_max is not None:
@@ -159,9 +166,9 @@ def set_disponibilidad(
 def set_servicios(
     taller_id: str,
     body: ServiciosIn,
-    user: CurrentUser = Depends(require_roles("ADMIN_TENANT", "TALLER")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("taller", "actualizar")),
 ):
+    user, perm, db = tupla
     for tipo_id in body.tipo_incidente_ids:
         db.execute(
             text(
@@ -176,10 +183,10 @@ def set_servicios(
 @router.get("/{taller_id}/especialidades")
 def list_especialidades(
     taller_id: str,
-    user: CurrentUser = Depends(require_roles("ADMIN_TENANT", "TALLER")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("especialidad_taller", "leer")),
     activo: bool | None = None,
 ):
+    user, perm, db = tupla
     _assert_taller_access(db, user, taller_id)
     count_row = db.execute(
         text(
@@ -205,9 +212,9 @@ def list_especialidades(
 def create_especialidad(
     taller_id: str,
     body: EspecialidadCreate,  # noqa: ARG001
-    user: CurrentUser = Depends(require_roles("ADMIN_TENANT", "TALLER")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("especialidad_taller", "crear")),
 ):
+    user, perm, db = tupla
     _assert_taller_access(db, user, taller_id)
     raise HTTPException(
         403,
@@ -221,9 +228,9 @@ def update_especialidad(
     taller_id: str,
     especialidad_id: str,
     body: EspecialidadUpdate,
-    user: CurrentUser = Depends(require_roles("ADMIN_TENANT", "TALLER")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("especialidad_taller", "actualizar")),
 ):
+    user, perm, db = tupla
     _assert_taller_access(db, user, taller_id)
     if body.nombre is not None:
         raise HTTPException(
@@ -248,9 +255,9 @@ def update_especialidad(
 def delete_especialidad(
     taller_id: str,
     especialidad_id: str,  # noqa: ARG001
-    user: CurrentUser = Depends(require_roles("ADMIN_TENANT", "TALLER")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("especialidad_taller", "eliminar")),
 ):
+    user, perm, db = tupla
     _assert_taller_access(db, user, taller_id)
     raise HTTPException(
         403,
@@ -261,9 +268,9 @@ def delete_especialidad(
 @router.get("/asignaciones")
 def list_mis_asignaciones(
     estado: str | None = None,
-    user: CurrentUser = Depends(require_roles("TALLER")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("asignacion", "leer")),
 ):
+    user, perm, db = tupla
     taller = db.execute(
         text("SELECT id FROM emergencias.taller WHERE usuario_id = :uid"),
         {"uid": user.id},
@@ -275,6 +282,7 @@ def list_mis_asignaciones(
                   a.tecnico_id, a.motivo_rechazo, a.respondido_at,
                   a.asignacion_automatica,
                   t.nombre AS taller_nombre,
+                  t.calificacion AS taller_calificacion,
                   i.estado AS incidente_estado,
                   i.descripcion AS incidente_descripcion,
                   i.direccion AS incidente_direccion,
@@ -282,6 +290,7 @@ def list_mis_asignaciones(
                   i.longitud AS incidente_longitud,
                   i.prioridad AS incidente_prioridad,
                   i.resumen_ia AS incidente_resumen_ia,
+                  ti.codigo AS tipo_codigo,
                   tc.distancia_km,
                   tc.tiempo_llegada_min,
                   tc.precio_sugerido,
@@ -289,10 +298,14 @@ def list_mis_asignaciones(
                   c.id AS cotizacion_id,
                   c.monto AS precio_ofertado,
                   c.tiempo_estimado_min AS tiempo_ofertado_min,
-                  c.estado AS cotizacion_estado
+                  c.estado AS cotizacion_estado,
+                  (SELECT count(*) FROM emergencias.asignacion ax
+                   WHERE ax.taller_id = a.taller_id
+                     AND ax.estado IN ('ASIGNADO', 'ACEPTADO')) AS carga
            FROM emergencias.asignacion a
            JOIN emergencias.taller t ON t.id = a.taller_id
            JOIN emergencias.incidente i ON i.id = a.incidente_id
+           LEFT JOIN emergencias.tipo_incidente ti ON ti.id = i.tipo_incidente_id
            LEFT JOIN emergencias.taller_candidato tc
              ON tc.incidente_id = a.incidente_id AND tc.taller_id = a.taller_id
            LEFT JOIN emergencias.cotizacion c ON c.asignacion_id = a.id
@@ -303,14 +316,40 @@ def list_mis_asignaciones(
         params["est"] = estado
     base_sql += " ORDER BY a.respondido_at DESC NULLS LAST"
     rows = db.execute(text(base_sql), params).mappings().all()
-    return {"items": [dict(r) for r in rows], "total": len(rows)}
+    items: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        pricing = pricing_as_dict(
+            item.get("tipo_codigo"),
+            item.get("incidente_prioridad"),
+            item.get("distancia_km"),
+            item.get("taller_calificacion"),
+            item.get("carga"),
+        )
+        if item.get("precio_sugerido") is not None:
+            ps = float(item["precio_sugerido"])
+            pricing["precio_sugerido"] = ps
+            pricing["precio_min"] = round(ps * 0.85, 2)
+            pricing["precio_max"] = round(ps * 1.25, 2)
+            pricing["comision_plataforma"] = round(ps * 0.10, 2)
+            pricing["monto_taller"] = round(ps - pricing["comision_plataforma"], 2)
+        if item.get("tiempo_llegada_min") is not None:
+            pricing["tiempo_llegada_min"] = int(item["tiempo_llegada_min"])
+        if item.get("dificultad") is not None:
+            pricing["dificultad"] = item["dificultad"]
+        item.update(pricing)
+        item.pop("taller_calificacion", None)
+        item.pop("tipo_codigo", None)
+        item.pop("carga", None)
+        items.append(item)
+    return {"items": items, "total": len(items)}
 
 
 @router.get("/notificaciones")
 def list_mis_notificaciones(
-    user: CurrentUser = Depends(require_roles("TALLER")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("notificacion", "leer")),
 ):
+    user, perm, db = tupla
     taller = db.execute(
         text("SELECT id FROM emergencias.taller WHERE usuario_id = :uid"),
         {"uid": user.id},
@@ -334,9 +373,9 @@ def list_mis_notificaciones(
 
 @router.get("/yo")
 def get_mi_taller(
-    user: CurrentUser = Depends(require_roles("TALLER")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("taller", "leer")),
 ):
+    user, perm, db = tupla
     row = db.execute(
         text("SELECT * FROM emergencias.taller WHERE usuario_id = :uid"),
         {"uid": user.id},
@@ -349,9 +388,9 @@ def get_mi_taller(
 @router.put("/disponibilidad")
 def set_disponibilidad_mio(
     body: DisponibilidadIn,
-    user: CurrentUser = Depends(require_roles("TALLER")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("taller", "actualizar")),
 ):
+    user, perm, db = tupla
     taller = db.execute(
         text("SELECT id FROM emergencias.taller WHERE usuario_id = :uid"),
         {"uid": user.id},

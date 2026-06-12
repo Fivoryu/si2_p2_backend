@@ -11,7 +11,9 @@ from .api import (
     incidentes,
     kpi,
     pagos,
+    plan_checkout,
     public,
+    roles,
     sync,
     talleres,
     tecnicos,
@@ -35,7 +37,8 @@ app = FastAPI(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins.split(","),
+    allow_origins=[o.strip() for o in settings.cors_origins.split(",") if o.strip()],
+    allow_origin_regex=settings.cors_origin_regex or None,
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
@@ -59,9 +62,11 @@ for r in (
     asignaciones,
     cotizaciones,
     pagos,
+    plan_checkout,
     kpi,
     tenants,
     sync,
+    roles,
 ):
     app.include_router(r.router)
 

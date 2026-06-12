@@ -1,11 +1,13 @@
 import uuid
+import secrets
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import text
 
-from ..core.deps import CurrentUser, get_current_user, get_db, require_roles
+from ..core.deps import require_permission
 from ..core.security import hash_password
+from ..services.email import send_temp_password_email
 
 router = APIRouter(prefix="/tenants", tags=["tenants"])
 
@@ -27,18 +29,20 @@ class PlanPatch(BaseModel):
 
 @router.get("")
 def list_tenants(
-    db=Depends(get_db),
+    tupla=Depends(require_permission("tenant", "leer")),
 ):
+    user, perm, db = tupla
     rows = db.execute(
         text("SELECT id, nombre, dominio, plan_id FROM emergencias.tenant ORDER BY nombre")
     ).mappings().all()
-    return {"items": [dict(r) for r in rows]}
+    return {"items": perm.filter_list("tenant", [dict(r) for r in rows])}
 
 
 @router.get("/planes")
 def list_plans(
-    db=Depends(get_db),
+    tupla=Depends(require_permission("plan", "leer")),
 ):
+    user, perm, db = tupla
     rows = db.execute(
         text("SELECT id, nombre FROM emergencias.plan ORDER BY nombre")
     ).mappings().all()
@@ -48,10 +52,11 @@ def list_plans(
 @router.post("", status_code=201)
 def create_tenant(
     body: TenantCreate,
-    user=Depends(require_roles("ADMIN_PLATAFORMA")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("tenant", "crear")),
 ):
+    user, perm, db = tupla
     tid = str(uuid.uuid4())
+    temp_password = secrets.token_urlsafe(12)
     db.execute(
         text(
             """INSERT INTO emergencias.tenant (id, nombre, dominio, plan_id)
@@ -66,34 +71,36 @@ def create_tenant(
 def assign_admin(
     tenant_id: str,
     body: TenantAdminIn,
-    user=Depends(require_roles("ADMIN_PLATAFORMA")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("usuario", "crear")),
 ):
+    user, perm, db = tupla
     uid = str(uuid.uuid4())
+    temp_password = secrets.token_urlsafe(12)
     db.execute(
         text(
             """INSERT INTO emergencias.usuario
-            (id, tenant_id, rol, nombre, email, password_hash, email_verificado)
-            VALUES (:id, :t, 'ADMIN_TENANT', :n, :e, :ph, true)"""
+            (id, tenant_id, rol, nombre, email, password_hash, email_verificado, must_change_password)
+            VALUES (:id, :t, 'ADMIN_TENANT', :n, :e, :ph, true, true)"""
         ),
         {
             "id": uid,
             "t": tenant_id,
             "n": body.nombre,
             "e": body.email.lower(),
-            "ph": hash_password("password123"),
+            "ph": hash_password(temp_password),
         },
     )
-    return {"usuario_id": uid}
+    send_temp_password_email(body.email.lower(), body.nombre, temp_password)
+    return {"usuario_id": uid, "password_temporal": temp_password}
 
 
 @router.patch("/{tenant_id}/plan")
 def patch_plan(
     tenant_id: str,
     body: PlanPatch,
-    user=Depends(require_roles("ADMIN_PLATAFORMA")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("tenant", "actualizar")),
 ):
+    user, perm, db = tupla
     db.execute(
         text("UPDATE emergencias.tenant SET plan_id = :p WHERE id = :id"),
         {"p": body.plan_id, "id": tenant_id},

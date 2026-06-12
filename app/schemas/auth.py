@@ -21,6 +21,12 @@ class LoginOut(BaseModel):
     rol: str
     tenant_id: str | None
     usuario_id: str
+    must_change_password: bool = False
+
+
+class ChangePasswordIn(BaseModel):
+    password_actual: str
+    password_nueva: str
 
 
 class ForgotPasswordIn(BaseModel):
