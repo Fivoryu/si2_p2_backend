@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     # AcquireMock payment gateway (mock stripe)
     acquiremock_url: str = "http://acquiremock:8000"
     acquiremock_webhook_secret: str = "am-dev-secret-min-32-chars-!!change"
+    # URLs para webhooks y redirects (configurar según entorno)
+    backend_internal_url: str = "http://backend:8000"
+    web_public_url: str = "http://localhost:4200"
     # Resend email
     resend_api_key: str = ""
     environment: str = "development"

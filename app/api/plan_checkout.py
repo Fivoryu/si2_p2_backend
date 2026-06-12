@@ -61,8 +61,8 @@ def plan_checkout(body: PlanCheckoutIn, db=Depends(get_db_public)):
                 json={
                     "amount": amount,
                     "reference": f"plan_{body.plan_id}_{invoice_id}",
-                    "webhookUrl": "http://backend:8000/pagos/plan-webhook",
-                    "redirectUrl": "http://localhost:4200/registro/exito",
+                    "webhookUrl": f"{settings.backend_internal_url}/pagos/plan-webhook",
+                    "redirectUrl": f"{settings.web_public_url}/registro/exito",
                 },
             )
             r.raise_for_status()
