@@ -83,10 +83,10 @@ def mis_notificaciones(
     rows = db.execute(
         text(
             """SELECT n.id, n.titulo, n.mensaje, n.canal, n.incidente_id,
-                      n.enviada, n.creada_at
+                      n.enviada, n.created_at
                FROM emergencias.notificacion n
                WHERE n.usuario_id = :uid
-               ORDER BY n.creada_at DESC
+               ORDER BY n.created_at DESC
                LIMIT 50"""
         ),
         {"uid": user.id},
