@@ -18,7 +18,10 @@ class Settings(BaseSettings):
     # URLs para webhooks y redirects (configurar según entorno)
     backend_internal_url: str = "http://backend:8000"
     web_public_url: str = "http://localhost:4200"
-    # Resend email
+    # Email provider: "console" (dev) | "ses" (AWS) | "resend"
+    email_provider: str = "console"
+    ses_sender_email: str = "noreply@auxilio.app"
+    # Resend email (legacy, usar email_provider en su lugar)
     resend_api_key: str = ""
     environment: str = "development"
     fcm_server_key: str = ""
