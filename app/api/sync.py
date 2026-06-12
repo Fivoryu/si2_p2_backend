@@ -1,10 +1,11 @@
 import base64
 import uuid
+from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, BackgroundTasks, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy import text
 
-from ..core.deps import get_db, require_roles
+from ..core.deps import require_permission
 from ..schemas.sync import SyncBatch
 from ..services.ai import run_ai_pipeline
 from ..services.transcription import transcribe_audio_bytes
@@ -16,11 +17,27 @@ router = APIRouter(prefix="/sync", tags=["sync"])
 def sync(
     body: SyncBatch,
     bg: BackgroundTasks,
-    user=Depends(require_roles("CONDUCTOR")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("incidente", "crear")),
 ):
+    user, perm, db = tupla
+    if len(body.incidentes) > 20:
+        raise HTTPException(413, "El lote offline no puede superar 20 incidentes")
     out = []
     for item in body.incidentes:
+        owns_vehicle = db.execute(
+            text(
+                """SELECT 1 FROM emergencias.vehiculo
+                WHERE id = :v AND conductor_id = :c"""
+            ),
+            {"v": str(item.vehiculo_id), "c": user.id},
+        ).first()
+        if not owns_vehicle:
+            raise HTTPException(403, "Vehiculo no pertenece al conductor")
+        if len(item.evidencias) > 6:
+            raise HTTPException(413, "Cada incidente offline acepta maximo 6 evidencias")
+        client_updated_at = item.client_updated_at
+        if client_updated_at > datetime.now(timezone.utc) + timedelta(minutes=10):
+            client_updated_at = datetime.now(timezone.utc)
         existing = db.execute(
             text(
                 """SELECT incidente_id FROM emergencias.sync_mapping
@@ -44,7 +61,7 @@ def sync(
                     "lo": item.longitud,
                     "dir": item.direccion,
                     "i": inc_id,
-                    "cu": item.client_updated_at,
+                    "cu": client_updated_at,
                 },
             )
             db.execute(
@@ -52,7 +69,7 @@ def sync(
                     """UPDATE emergencias.sync_mapping SET last_write_at = :cu
                     WHERE tenant_id = :t AND external_id = :e"""
                 ),
-                {"cu": item.client_updated_at, "t": user.tenant, "e": str(item.external_id)},
+                {"cu": client_updated_at, "t": user.tenant, "e": str(item.external_id)},
             )
             out.append(
                 {
@@ -98,7 +115,7 @@ def sync(
                 "e": str(item.external_id),
                 "i": inc_id,
                 "dev": body.dispositivo,
-                "cu": item.client_updated_at,
+                "cu": client_updated_at,
             },
         )
         for ev in item.evidencias:
@@ -107,6 +124,8 @@ def sync(
             texto = ev.texto
             if ev.contenido_b64:
                 try:
+                    if len(ev.contenido_b64) > 8 * 1024 * 1024:
+                        raise HTTPException(413, "Evidencia offline demasiado grande")
                     data = base64.b64decode(ev.contenido_b64)
                     mime = ev.mime_type or "application/octet-stream"
                     key = f"{user.tenant}/{inc_id}/{eid}"
@@ -119,6 +138,8 @@ def sync(
                         url = f"local://{key}"
                     if ev.tipo == "AUDIO" and not ev.texto:
                         texto = None
+                except HTTPException:
+                    raise
                 except Exception:
                     url = f"sync/{inc_id}/{eid}"
             db.execute(

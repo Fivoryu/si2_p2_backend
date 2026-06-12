@@ -132,13 +132,13 @@ class TestAsignarTallerOptimo:
         finally:
             cleanup_incidente(inc_id)
 
-    def test_solo_conductor_puede_asignar(self, client, db, cleanup_incidente, login_taller):
+    def test_cualquier_usuario_autenticado_puede_asignar(self, client, db, cleanup_incidente, login_taller):
         inc_id = str(uuid.uuid4())
         auth_taller = login_taller()
         create_incidente(db, inc_id)
         try:
             r = client.post(f"/incidentes/{inc_id}/asignar", headers=auth_taller)
-            assert r.status_code == 403, f"Expected 403, got {r.status_code}"
+            assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text}"
         finally:
             cleanup_incidente(inc_id)
 

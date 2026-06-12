@@ -8,14 +8,20 @@ Provee:
 """
 
 import asyncio
+import logging
 import math
-import random
 from dataclasses import dataclass
-from typing import Literal
 
 import httpx
 
-OSRM_URL = "http://osrm:5000"
+from ..core.config import settings
+
+logger = logging.getLogger(__name__)
+
+OSRM_FALLBACK_URLS = (
+    settings.osrm_url,
+    settings.osrm_public_url,
+)
 
 
 @dataclass
@@ -31,35 +37,45 @@ async def calcular_ruta_osrm(
     destino: tuple[float, float],
 ) -> RouteResult | None:
     """
-    Llama a OSRM para calcular ruta driving entre origen y destino.
-    coords retorna lista de (lng, lat) en el orden de la ruta.
-    Retorna None si OSRM no está disponible.
+    Llama a OSRM (local Docker o servidor público) para ruta driving.
+    Retorna None si ningún servidor responde.
     """
-    url = (
-        f"{OSRM_URL}/route/v1/driving/"
+    path = (
+        f"/route/v1/driving/"
         f"{origen[0]},{origen[1]};{destino[0]},{destino[1]}"
         f"?overview=full&geometries=geojson&steps=false"
     )
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            data = resp.json()
 
-        if data.get("code") != "Ok" or not data.get("routes"):
-            return None
+    for base in OSRM_FALLBACK_URLS:
+        if not base:
+            continue
+        url = f"{base.rstrip('/')}{path}"
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
 
-        route = data["routes"][0]
-        coords_raw = route["geometry"]["coordinates"]
-        coords = [(float(c[0]), float(c[1])) for c in coords_raw]
+            if data.get("code") != "Ok" or not data.get("routes"):
+                continue
 
-        return RouteResult(
-            coords=coords,
-            distancia_km=route["distance"] / 1000.0,
-            duracion_seg=route["duration"],
-        )
-    except Exception:
-        return None
+            route = data["routes"][0]
+            coords_raw = route["geometry"]["coordinates"]
+            coords = [(float(c[0]), float(c[1])) for c in coords_raw]
+            if len(coords) < 2:
+                continue
+
+            logger.info("Ruta OSRM obtenida desde %s (%d puntos)", base, len(coords))
+            return RouteResult(
+                coords=coords,
+                distancia_km=route["distance"] / 1000.0,
+                duracion_seg=route["duration"],
+            )
+        except Exception as exc:
+            logger.warning("OSRM no disponible en %s: %s", base, exc)
+            continue
+
+    return None
 
 
 def generar_ruta_fake(
@@ -67,50 +83,69 @@ def generar_ruta_fake(
     destino: tuple[float, float],
     num_puntos: int = 50,
 ) -> RouteResult:
+    """Fallback: ruta tipo calles con tramos ortogonales cada ~30 m."""
+    return generar_ruta_calles(origen, destino, paso_km=0.03)
+
+
+def generar_ruta_calles(
+    origen: tuple[float, float],
+    destino: tuple[float, float],
+    paso_km: float = 0.03,
+) -> RouteResult:
     """
-    Genera una ruta fake 'realista' con variaciones simulando calles y dobleces.
-    Usa Bezier simple con puntos de control aleatorios para simular el recorrido.
-    No requiere servicio externo.
+    Simula recorrido por calles con tramos en L (avenida + calle).
+    Inserta puntos cada paso_km para movimiento fluido.
     """
     lon1, lat1 = origen
     lon2, lat2 = destino
 
-    mid_lon = (lon1 + lon2) / 2
-    mid_lat = (lat1 + lat2) / 2
-
-    dx = lon2 - lon1
-    dy = lat2 - lat1
-    dist = math.sqrt(dx * dx + dy * dy)
-    perp_x = -dy / dist if dist > 0 else 0
-    perp_y = dx / dist if dist > 0 else 0
-
-    max_deviation = dist * 0.15
-    cp1_lon = mid_lon + perp_x * random.uniform(-max_deviation, max_deviation)
-    cp1_lat = mid_lat + perp_y * random.uniform(-max_deviation, max_deviation)
-
-    cp2_lon = mid_lon + perp_x * random.uniform(-max_deviation, max_deviation)
-    cp2_lat = mid_lat + perp_y * random.uniform(-max_deviation, max_deviation)
-
-    def cubic_bezier(t: float) -> tuple[float, float]:
-        mt = 1 - t
-        x = mt * mt * mt * lon1 + 3 * mt * mt * t * cp1_lon + 3 * mt * t * t * cp2_lon + t * t * t * lon2
-        y = mt * mt * mt * lat1 + 3 * mt * mt * t * cp1_lat + 3 * mt * t * t * cp2_lat + t * t * t * lat2
-        return x, y
+    dx = abs(lon2 - lon1)
+    dy = abs(lat2 - lat1)
+    # Primero el eje con mayor separación (como seguir avenida principal)
+    if dx >= dy:
+        waypoints = [origen, (lon2, lat1), destino]
+    else:
+        waypoints = [origen, (lon1, lat2), destino]
 
     coords: list[tuple[float, float]] = []
-    for i in range(num_puntos + 1):
-        t = i / num_puntos
-        coords.append(cubic_bezier(t))
+    for i, (a, b) in enumerate(zip(waypoints, waypoints[1:])):
+        segment = _interp_segmento(a, b, paso_km)
+        if i > 0 and segment:
+            segment = segment[1:]
+        coords.extend(segment)
 
-    haversine_dist = _haversine_km(origen, destino)
-    fake_dist = haversine_dist * random.uniform(1.3, 1.6)
-    fake_duracion = (fake_dist / 40.0) * 3600
+    if not coords:
+        coords = [origen, destino]
+
+    total_km = sum(
+        calcular_distancia_puntos(coords[i], coords[i + 1])
+        for i in range(len(coords) - 1)
+    )
+    duracion = (total_km / 40.0) * 3600 if total_km > 0 else 0
 
     return RouteResult(
         coords=coords,
-        distancia_km=fake_dist,
-        duracion_seg=fake_duracion,
+        distancia_km=total_km,
+        duracion_seg=duracion,
     )
+
+
+def _interp_segmento(
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    paso_km: float,
+) -> list[tuple[float, float]]:
+    dist = calcular_distancia_puntos(p1, p2)
+    if dist < 0.0001:
+        return [p1]
+    steps = max(2, int(dist / paso_km) + 1)
+    pts: list[tuple[float, float]] = []
+    for i in range(steps):
+        t = i / (steps - 1)
+        lon = p1[0] * (1 - t) + p2[0] * t
+        lat = p1[1] * (1 - t) + p2[1] * t
+        pts.append((lon, lat))
+    return pts
 
 
 def interpolar_punto(
@@ -160,59 +195,90 @@ async def obtener_ruta(
     origen: tuple[float, float],
     destino: tuple[float, float],
     usar_osrm: bool = True,
-) -> RouteResult:
+) -> tuple[RouteResult, str]:
     """
-    Obtiene ruta: intenta OSRM primero, si falla o usar_osrm=False
-    genera ruta fake con variaciones realistas.
+    Obtiene ruta. Retorna (RouteResult, motor) donde motor es 'osrm' o 'calles'.
     """
     if usar_osrm:
         ruta = await calcular_ruta_osrm(origen, destino)
         if ruta:
-            return ruta
+            return ruta, "osrm"
 
-    return generar_ruta_fake(origen, destino)
+    logger.info("Usando ruta simulada por calles (fallback)")
+    return generar_ruta_fake(origen, destino), "calles"
 
 
 async def generar_puntos_interpolados(
     coords: list[tuple[float, float]],
     velocidad_kmh: float,
     intervalo_seg: float,
-    distancia_total_km: float,
+    distancia_total_km: float | None = None,
 ) -> list[tuple[float, float, float]]:
     """
-    Genera puntos (lon, lat, tiempo_desde_inicio_seg) interpolados
-    a lo largo de la ruta para una velocidad e intervalo dados.
+    Genera puntos (lon, lat, tiempo_desde_inicio_seg) a intervalos fijos
+    recorriendo toda la polilínea de la ruta.
     """
     if not coords or velocidad_kmh <= 0 or intervalo_seg <= 0:
         return []
 
+    cum_dist = [0.0]
+    for i in range(1, len(coords)):
+        cum_dist.append(
+            cum_dist[-1] + calcular_distancia_puntos(coords[i - 1], coords[i])
+        )
+
+    total_km = distancia_total_km if distancia_total_km is not None else cum_dist[-1]
+    if total_km <= 0:
+        return [(coords[0][0], coords[0][1], 0.0)]
+
+    speed_km_s = velocidad_kmh / 3600.0
+    step_km = speed_km_s * intervalo_seg
+
     puntos: list[tuple[float, float, float]] = []
-    tiempo_acum = 0.0
-    distancia_acum = 0.0
+    d = 0.0
+    t = 0.0
+    while d <= total_km + 1e-9:
+        lon, lat = _interpolar_por_distancia(coords, cum_dist, d)
+        puntos.append((lon, lat, t))
+        if d >= total_km:
+            break
+        d = min(d + step_km, total_km)
+        t += intervalo_seg
 
-    for i in range(len(coords) - 1):
-        p1 = coords[i]
-        p2 = coords[i + 1]
-        seg_dist = calcular_distancia_puntos(p1, p2)
-
-        if seg_dist < 0.0001:
-            continue
-
-        tiempo_seg = (seg_dist / velocidad_kmh) * 3600
-        num_pasos = max(1, int(round(seg_dist / (velocidad_kmh * intervalo_seg / 3600))))
-
-        for j in range(num_pasos):
-            t = j / num_pasos if num_pasos > 1 else 0.0
-            lon = p1[0] * (1 - t) + p2[0] * t
-            lat = p1[1] * (1 - t) + p2[1] * t
-            puntos.append((lon, lat, tiempo_acum + t * tiempo_seg))
-            distancia_acum += seg_dist * t
-
-        tiempo_acum += tiempo_seg
-        distancia_acum += seg_dist
-        puntos.append((p2[0], p2[1], tiempo_acum))
+    last = coords[-1]
+    if not puntos or puntos[-1][:2] != last:
+        puntos.append((last[0], last[1], t))
 
     return puntos
+
+
+def _interpolar_por_distancia(
+    coords: list[tuple[float, float]],
+    cum_dist: list[float],
+    km: float,
+) -> tuple[float, float]:
+    if km <= 0:
+        return coords[0]
+    if km >= cum_dist[-1]:
+        return coords[-1]
+
+    lo, hi = 0, len(cum_dist) - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if cum_dist[mid] < km:
+            lo = mid + 1
+        else:
+            hi = mid
+
+    idx = max(1, lo)
+    seg_len = cum_dist[idx] - cum_dist[idx - 1]
+    if seg_len <= 0:
+        return coords[idx]
+
+    t = (km - cum_dist[idx - 1]) / seg_len
+    lon = coords[idx - 1][0] * (1 - t) + coords[idx][0] * t
+    lat = coords[idx - 1][1] * (1 - t) + coords[idx][1] * t
+    return (lon, lat)
 
 
 def es_geocerca_cercana(

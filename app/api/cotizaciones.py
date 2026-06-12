@@ -1,15 +1,44 @@
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import text
 
-from ..core.deps import CurrentUser, get_db, require_roles
-from ..services.notifications import notify_incident_users
+from ..core.deps import CurrentUser, get_current_user_verified, require_permission
+from ..core.db import SessionLocal
+from ..services.notifications import OFFER_SELECTED_NOTIFICATION, notify_incident_users
+from ..services.permissions import PermissionService
 from ..ws.manager import manager
 
 router = APIRouter(tags=["cotizaciones"])
+
+
+def require_seleccionar_cotizacion():
+    """Conductor puede seleccionar ofertas de sus incidentes sin permiso cotizacion:actualizar."""
+    def _guard(user: CurrentUser = Depends(get_current_user_verified)):
+        db = SessionLocal()
+        try:
+            db.execute(
+                text("SELECT set_config('app.current_tenant', :t, true)"),
+                {"t": user.tenant or ""},
+            )
+            svc = PermissionService(db, user)
+            svc._load()
+            if user.rol != "CONDUCTOR" and not svc.can("cotizacion", "actualizar"):
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    "Requires 'actualizar' on 'cotizacion'",
+                )
+            yield user, svc, db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    return _guard
 
 
 class CotizacionIn(BaseModel):
@@ -24,9 +53,9 @@ class CotizacionIn(BaseModel):
 def crear_cotizacion(
     incidente_id: str,
     body: CotizacionIn,
-    user=Depends(require_roles("TALLER", "ADMIN_TENANT")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("cotizacion", "crear")),
 ):
+    user, perm, db = tupla
     taller_id = body.taller_id
     if not taller_id and user.rol == "TALLER":
         row = db.execute(
@@ -62,9 +91,9 @@ def crear_cotizacion(
 @router.get("/incidentes/{incidente_id}/ofertas")
 def listar_ofertas(
     incidente_id: str,
-    user: CurrentUser = Depends(require_roles("CONDUCTOR", "ADMIN_TENANT")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("cotizacion", "leer")),
 ):
+    user, perm, db = tupla
     where_owner = ""
     params: dict = {"i": incidente_id}
     if user.rol == "CONDUCTOR":
@@ -99,18 +128,22 @@ def listar_ofertas(
 @router.post("/cotizaciones/{cotizacion_id}/aceptar")
 async def aceptar_cotizacion(
     cotizacion_id: str,
-    user: CurrentUser = Depends(require_roles("CONDUCTOR")),
-    db=Depends(get_db),
+    tupla=Depends(require_seleccionar_cotizacion()),
 ):
-    return await seleccionar_cotizacion(cotizacion_id, user, db)
+    user, perm, db = tupla
+    return await _seleccionar_cotizacion_impl(cotizacion_id, user, db)
 
 
 @router.post("/cotizaciones/{cotizacion_id}/seleccionar")
 async def seleccionar_cotizacion(
     cotizacion_id: str,
-    user: CurrentUser = Depends(require_roles("CONDUCTOR")),
-    db=Depends(get_db),
+    tupla=Depends(require_seleccionar_cotizacion()),
 ):
+    user, perm, db = tupla
+    return await _seleccionar_cotizacion_impl(cotizacion_id, user, db)
+
+
+async def _seleccionar_cotizacion_impl(cotizacion_id: str, user: CurrentUser, db):
     cot = db.execute(
         text(
             """SELECT c.id, c.incidente_id, c.asignacion_id, c.taller_id, c.tenant_id,
@@ -166,11 +199,5 @@ async def seleccionar_cotizacion(
             "data": {"estado_nuevo": "EN_CAMINO", "cotizacion_id": cotizacion_id},
         },
     )
-    await notify_incident_users(
-        db,
-        tenant,
-        iid,
-        "Oferta seleccionada",
-        "El cliente selecciono una oferta. El tecnico va en camino.",
-    )
+    await notify_incident_users(db, tenant, iid, *OFFER_SELECTED_NOTIFICATION)
     return {"estado": "ACEPTADA"}

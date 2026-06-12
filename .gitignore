@@ -7,3 +7,10 @@ __pycache__/
 ml/runs/
 ml/datasets/
 data/evidencias/
+runs/
+datasets/
+yolov8n.pt
+db_check.py
+debug_test.py
+car-accident/
+car-dashboard/

@@ -1,3 +1,7 @@
+import asyncio
+import logging
+from pathlib import Path
+
 import httpx
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -5,8 +9,18 @@ from sqlalchemy.orm import Session
 from ..core.config import settings
 from ..core.db import scoped_session
 
+logger = logging.getLogger(__name__)
+_firebase_ready = False
 
 ESTADO_NOTIFICATIONS = {
+    "BUSCANDO_TALLER": (
+        "Buscando taller",
+        "Estamos buscando talleres disponibles cerca de tu ubicación.",
+    ),
+    "TALLER_ASIGNADO": (
+        "Taller asignado",
+        "Se asignó un taller a tu emergencia. Pronto recibirás ofertas o confirmación.",
+    ),
     "EN_CAMINO": (
         "Técnico en camino",
         "El técnico está dirigiéndose a tu ubicación. ¡Estamos en camino!",
@@ -21,10 +35,53 @@ ESTADO_NOTIFICATIONS = {
     ),
 }
 
+OFFER_NOTIFICATION = (
+    "Nueva oferta recibida",
+    "Un taller envió una oferta para tu emergencia. Revisa las opciones disponibles.",
+)
 
-async def send_push(token: str, title: str, body: str, data: dict | None = None):
-    if not settings.fcm_server_key or not token:
-        return
+OFFER_SELECTED_NOTIFICATION = (
+    "Oferta aceptada",
+    "Se confirmó la oferta. El técnico va en camino hacia tu ubicación.",
+)
+
+
+def _init_firebase() -> bool:
+    global _firebase_ready
+    if _firebase_ready:
+        return True
+
+    path = settings.fcm_service_account_path.strip()
+    if not path or not Path(path).is_file():
+        return False
+
+    try:
+        import firebase_admin
+        from firebase_admin import credentials
+
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(credentials.Certificate(path))
+        _firebase_ready = True
+        logger.info("FCM HTTP v1 listo (service account: %s)", path)
+        return True
+    except Exception as exc:
+        logger.warning("No se pudo inicializar Firebase Admin: %s", exc)
+        return False
+
+
+async def _send_push_v1(token: str, title: str, body: str, data: dict | None = None):
+    from firebase_admin import messaging
+
+    message = messaging.Message(
+        notification=messaging.Notification(title=title, body=body),
+        data={k: str(v) for k, v in (data or {}).items()},
+        token=token,
+    )
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, messaging.send, message)
+
+
+async def _send_push_legacy(token: str, title: str, body: str, data: dict | None = None):
     async with httpx.AsyncClient() as client:
         await client.post(
             "https://fcm.googleapis.com/fcm/send",
@@ -39,6 +96,24 @@ async def send_push(token: str, title: str, body: str, data: dict | None = None)
             },
             timeout=10,
         )
+
+
+async def send_push(token: str, title: str, body: str, data: dict | None = None):
+    if not token:
+        return
+
+    if _init_firebase():
+        try:
+            await _send_push_v1(token, title, body, data)
+            return
+        except Exception as exc:
+            logger.warning("FCM v1 falló para token …%s: %s", token[-8:], exc)
+
+    if settings.fcm_server_key:
+        try:
+            await _send_push_legacy(token, title, body, data)
+        except Exception as exc:
+            logger.warning("FCM legacy falló: %s", exc)
 
 
 def save_notification(

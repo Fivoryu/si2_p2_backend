@@ -5,9 +5,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import text
 
-from ..core.deps import CurrentUser, get_db, require_roles
+from ..core.deps import CurrentUser, get_db, require_permission, require_roles
+from ..services.access import best_tecnico_for_assignment, sql_user_owns_taller_asignacion
 from ..services.assignment import assign_best_workshop
-from ..services.notifications import notify_incident_users
+from ..services.notifications import ESTADO_NOTIFICATIONS, OFFER_NOTIFICATION, notify_incident_users
+from ..services.estado_ws import emit_estado_cambio
 from ..services.pricing import calculate_service_offer
 from ..ws.manager import manager
 
@@ -34,35 +36,40 @@ class ManualAssignIn(BaseModel):
 
 
 @router.post("/incidentes/{incidente_id}/buscar-talleres")
-def buscar_talleres(incidente_id: str, db=Depends(get_db)):
+def buscar_talleres(incidente_id: str):
+    from ..core.deps import SessionLocal
     from ..services.assignment import CANDIDATE_SQL
 
-    rows = db.execute(CANDIDATE_SQL, {"inc": incidente_id}).mappings().all()
-    candidatos = []
-    for row in rows:
-        item = dict(row)
-        pricing = calculate_service_offer(
-            item.get("tipo_codigo"),
-            item.get("prioridad"),
-            item.get("distancia_km"),
-            item.get("calificacion"),
-            item.get("carga"),
-        )
-        item["precio_sugerido"] = pricing.precio_sugerido
-        item["tiempo_llegada_min"] = pricing.tiempo_llegada_min
-        item["tiempo_reparacion_min"] = pricing.tiempo_reparacion_min
-        item["tiempo_total_min"] = pricing.tiempo_total_min
-        item["dificultad"] = pricing.dificultad
-        candidatos.append(item)
-    return {"candidatos": candidatos}
+    db = SessionLocal()
+    try:
+        rows = db.execute(CANDIDATE_SQL, {"inc": incidente_id}).mappings().all()
+        candidatos = []
+        for row in rows:
+            item = dict(row)
+            pricing = calculate_service_offer(
+                item.get("tipo_codigo"),
+                item.get("prioridad"),
+                item.get("distancia_km"),
+                item.get("calificacion"),
+                item.get("carga"),
+            )
+            item["precio_sugerido"] = pricing.precio_sugerido
+            item["tiempo_llegada_min"] = pricing.tiempo_llegada_min
+            item["tiempo_reparacion_min"] = pricing.tiempo_reparacion_min
+            item["tiempo_total_min"] = pricing.tiempo_total_min
+            item["dificultad"] = pricing.dificultad
+            candidatos.append(item)
+        return {"candidatos": candidatos}
+    finally:
+        db.close()
 
 
 @router.post("/incidentes/{incidente_id}/asignar")
 async def asignar_auto(
     incidente_id: str,
-    user: CurrentUser = Depends(require_roles("CONDUCTOR", "ADMIN_TENANT")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("asignacion", "crear")),
 ):
+    user, perm, db = tupla
     await assign_best_workshop(incidente_id, user.tenant)
     return {"ok": True}
 
@@ -71,9 +78,9 @@ async def asignar_auto(
 async def asignar_manual(
     incidente_id: str,
     body: ManualAssignIn,
-    user: CurrentUser = Depends(require_roles("CONDUCTOR")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("asignacion", "crear")),
 ):
+    user, perm, db = tupla
     db.execute(
         text(
             """INSERT INTO emergencias.asignacion
@@ -98,8 +105,7 @@ async def asignar_manual(
     )
     await notify_incident_users(
         db, user.tenant, incidente_id,
-        "Taller Assigned",
-        "A workshop has been assigned to your assistance request.",
+        *ESTADO_NOTIFICATIONS["TALLER_ASIGNADO"],
     )
     return {"ok": True}
 
@@ -108,19 +114,32 @@ async def asignar_manual(
 async def aceptar(
     asignacion_id: str,
     body: AceptarIn,
-    user: CurrentUser = Depends(require_roles("TALLER")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("asignacion", "actualizar")),
 ):
+    user, perm, db = tupla
+    access_sql, access_params = sql_user_owns_taller_asignacion(user)
+    params = {"id": asignacion_id, **access_params}
     asig = db.execute(
         text(
-            """SELECT a.id, a.incidente_id, a.tenant_id FROM emergencias.asignacion a
-            JOIN emergencias.taller t ON t.id = a.taller_id
-            WHERE a.id = :id AND t.usuario_id = :u"""
+            f"""SELECT a.id, a.incidente_id, a.tenant_id, a.taller_id, i.tipo_incidente_id
+            FROM emergencias.asignacion a
+            JOIN emergencias.incidente i ON i.id = a.incidente_id
+            WHERE a.id = :id AND {access_sql}"""
         ),
-        {"id": asignacion_id, "u": user.id},
+        params,
     ).mappings().first()
     if not asig:
         raise HTTPException(404, "Not found")
+    tecnico_id = body.tecnico_id or best_tecnico_for_assignment(
+        db,
+        str(asig["taller_id"]),
+        str(asig["tipo_incidente_id"]) if asig.get("tipo_incidente_id") else None,
+    )
+    inc_row = db.execute(
+        text("SELECT estado FROM emergencias.incidente WHERE id = :i"),
+        {"i": str(asig["incidente_id"])},
+    ).mappings().first()
+    old_estado = str(inc_row["estado"]) if inc_row else "TALLER_ASIGNADO"
     db.execute(
         text(
             """UPDATE emergencias.asignacion
@@ -135,21 +154,7 @@ async def aceptar(
     )
     tid = str(asig["tenant_id"])
     iid = str(asig["incidente_id"])
-    await manager.publish(
-        tid,
-        iid,
-        {
-            "type": "STATUS_CHANGED",
-            "incident_id": iid,
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "data": {"estado_nuevo": "EN_CAMINO"},
-        },
-    )
-    await notify_incident_users(
-        db, tid, iid,
-        "Taller Accepted",
-        "Your assistance request has been accepted! A technician is on the way.",
-    )
+    await emit_estado_cambio(db, tid, iid, old_estado, "EN_CAMINO")
     return {"estado": "EN_CAMINO"}
 
 
@@ -157,13 +162,15 @@ async def aceptar(
 async def aceptar_con_oferta(
     asignacion_id: str,
     body: AceptarConOfertaIn,
-    user: CurrentUser = Depends(require_roles("TALLER")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("asignacion", "actualizar")),
 ):
+    user, perm, db = tupla
+    access_sql, access_params = sql_user_owns_taller_asignacion(user)
+    params = {"id": asignacion_id, **access_params}
     asig = db.execute(
         text(
-            """SELECT a.id, a.incidente_id, a.taller_id, a.tenant_id,
-                      i.prioridad, ti.codigo AS tipo_codigo,
+            f"""SELECT a.id, a.incidente_id, a.taller_id, a.tenant_id,
+                      i.prioridad, i.tipo_incidente_id, ti.codigo AS tipo_codigo,
                       tc.distancia_km, tc.tiempo_llegada_min,
                       t.calificacion,
                       (SELECT count(*) FROM emergencias.asignacion ax
@@ -174,9 +181,9 @@ async def aceptar_con_oferta(
                LEFT JOIN emergencias.tipo_incidente ti ON ti.id = i.tipo_incidente_id
                LEFT JOIN emergencias.taller_candidato tc
                  ON tc.incidente_id = a.incidente_id AND tc.taller_id = a.taller_id
-               WHERE a.id = :id AND t.usuario_id = :u AND a.estado = 'ASIGNADO'"""
+               WHERE a.id = :id AND a.estado = 'ASIGNADO' AND {access_sql}"""
         ),
-        {"id": asignacion_id, "u": user.id},
+        params,
     ).mappings().first()
     if not asig:
         raise HTTPException(404, "Asignacion no encontrada o no disponible")
@@ -194,6 +201,11 @@ async def aceptar_con_oferta(
     tiempo = body.tiempo_estimado_min or pricing.tiempo_total_min
     if tiempo <= 0:
         raise HTTPException(422, "El tiempo estimado debe ser mayor a cero")
+    tecnico_id = body.tecnico_id or best_tecnico_for_assignment(
+        db,
+        str(asig["taller_id"]),
+        str(asig["tipo_incidente_id"]) if asig.get("tipo_incidente_id") else None,
+    )
 
     cot_id = str(uuid.uuid4())
     db.execute(
@@ -237,14 +249,29 @@ async def aceptar_con_oferta(
                SET tecnico_id = COALESCE(:tec, tecnico_id), respondido_at = now()
                WHERE id = :id"""
         ),
-        {"id": asignacion_id, "tec": body.tecnico_id},
+        {"id": asignacion_id, "tec": tecnico_id},
     )
     await notify_incident_users(
         db,
         user.tenant,
         str(asig["incidente_id"]),
-        "Nueva oferta recibida",
-        "Un taller envio una oferta para tu emergencia.",
+        *OFFER_NOTIFICATION,
+    )
+    incidente_id = str(asig["incidente_id"])
+    await manager.publish(
+        user.tenant,
+        incidente_id,
+        {
+            "type": "OFFER_RECEIVED",
+            "incident_id": incidente_id,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "data": {
+                "cotizacion_id": cot_id,
+                "precio_ofertado": precio,
+                "tiempo_estimado_min": tiempo,
+                "taller_id": str(asig["taller_id"]),
+            },
+        },
     )
     return {
         "cotizacion_id": cot_id,
@@ -259,20 +286,21 @@ async def aceptar_con_oferta(
 async def rechazar(
     asignacion_id: str,
     body: RechazarIn,
-    user: CurrentUser = Depends(require_roles("TALLER")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("asignacion", "actualizar")),
 ):
+    user, perm, db = tupla
+    access_sql, access_params = sql_user_owns_taller_asignacion(user)
+    params = {"id": asignacion_id, **access_params}
     asig = db.execute(
         text(
-            """SELECT a.id, a.incidente_id, a.taller_id, a.tenant_id
+            f"""SELECT a.id, a.incidente_id, a.taller_id, a.tenant_id
             FROM emergencias.asignacion a
-            JOIN emergencias.taller t ON t.id = a.taller_id
-            WHERE a.id = :id AND t.usuario_id = :u"""
+            WHERE a.id = :id AND a.estado = 'ASIGNADO' AND {access_sql}"""
         ),
-        {"id": asignacion_id, "u": user.id},
+        params,
     ).mappings().first()
     if not asig:
-        raise HTTPException(404, "Not found")
+        raise HTTPException(404, "Asignacion no encontrada o no disponible")
     db.execute(
         text(
             """UPDATE emergencias.asignacion

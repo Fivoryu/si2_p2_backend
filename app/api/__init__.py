@@ -6,6 +6,7 @@ from . import (
     incidentes,
     kpi,
     pagos,
+    reportes,
     sync,
     talleres,
     tecnicos,

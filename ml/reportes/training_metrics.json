@@ -1,0 +1,15 @@
+{
+  "accuracy": 1.0,
+  "epochs_run": 17,
+  "classes": [
+    "AGGREGATE",
+    "COMPARE",
+    "COUNT",
+    "EXPLAIN",
+    "LIST",
+    "MAP",
+    "RANKING",
+    "TREND"
+  ],
+  "vocab_size": 500
+}

@@ -77,8 +77,8 @@ class TestCU33WebSocket:
                 snap = ws.receive_json()
                 assert snap["type"] == "STATE_SNAPSHOT"
                 assert snap["incident_id"] == inc_id
-                assert snap["data"]["estado"] == "EN_CAMINO"
-                assert snap["data"]["latitud"] is not None
+                assert snap["data"]["incidente"]["estado"] == "EN_CAMINO"
+                assert snap["data"]["incidente"]["latitud"] is not None
 
                 ws.send_json({"type": "PING"})
                 assert ws.receive_json()["type"] == "PONG"

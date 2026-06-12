@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import text
 
-from ..core.deps import CurrentUser, get_db, require_roles
+from ..core.deps import CurrentUser, require_permission
 
 router = APIRouter(prefix="/vehiculos", tags=["vehiculos"])
 
@@ -20,11 +20,11 @@ class VehiculoIn(BaseModel):
 
 @router.get("")
 def list_vehiculos(
-    user: CurrentUser = Depends(require_roles("CONDUCTOR")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("vehiculo", "leer")),
     limit: int = 50,
     offset: int = 0,
 ):
+    user, perm, db = tupla
     rows = db.execute(
         text(
             """SELECT * FROM emergencias.vehiculo
@@ -43,9 +43,9 @@ def list_vehiculos(
 @router.post("", status_code=201)
 def create_vehiculo(
     body: VehiculoIn,
-    user: CurrentUser = Depends(require_roles("CONDUCTOR")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("vehiculo", "crear")),
 ):
+    user, perm, db = tupla
     dup = db.execute(
         text(
             """SELECT id FROM emergencias.vehiculo
@@ -81,9 +81,9 @@ def create_vehiculo(
 def patch_vehiculo(
     vehiculo_id: str,
     body: VehiculoIn,
-    user: CurrentUser = Depends(require_roles("CONDUCTOR")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("vehiculo", "actualizar")),
 ):
+    user, perm, db = tupla
     db.execute(
         text(
             """UPDATE emergencias.vehiculo
@@ -107,9 +107,9 @@ def patch_vehiculo(
 @router.delete("/{vehiculo_id}", status_code=204)
 def delete_vehiculo(
     vehiculo_id: str,
-    user: CurrentUser = Depends(require_roles("CONDUCTOR")),
-    db=Depends(get_db),
+    tupla=Depends(require_permission("vehiculo", "eliminar")),
 ):
+    user, perm, db = tupla
     db.execute(
         text("DELETE FROM emergencias.vehiculo WHERE id = :id AND conductor_id = :c"),
         {"id": vehiculo_id, "c": user.id},

@@ -43,9 +43,15 @@ class UbicacionIn(BaseModel):
     lng: float
     tecnico_id: str | None = None
     es_fake: bool = False
+    velocidad_kmh: float | None = None
+    precision_m: float | None = None
 
 
 class SimularIn(BaseModel):
     velocidad_kmh: float = 40.0
+    duracion_sim_min: float | None = Field(default=None, gt=0, le=120)
     usar_fake: bool = True
-    intervalo_seg: float = 3.0
+    usar_osrm: bool = True
+    intervalo_seg: float = 1.0
+    origen_lat: float | None = None
+    origen_lng: float | None = None

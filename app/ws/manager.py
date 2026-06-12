@@ -2,6 +2,7 @@ import asyncio
 import json
 import uuid
 from collections import defaultdict
+from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
 from fastapi import WebSocket
@@ -11,6 +12,10 @@ from ..core.config import settings
 
 def channel(tenant_id: str, incident_id: str) -> str:
     return f"ws:tenant:{tenant_id}:incident:{incident_id}"
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class WSManager:
@@ -66,6 +71,7 @@ class WSManager:
         await self.publish(tenant_id, incident_id, {
             "type": "STATE_SNAPSHOT",
             "incident_id": incident_id,
+            "ts": now_iso(),
             "data": incident_data,
         })
 
@@ -80,6 +86,7 @@ class WSManager:
         await self.publish(tenant_id, incident_id, {
             "type": "STATUS_CHANGED",
             "incident_id": incident_id,
+            "ts": now_iso(),
             "data": {
                 "estado_anterior": estado_anterior,
                 "estado_nuevo": estado_nuevo,
@@ -98,6 +105,7 @@ class WSManager:
         await self.publish(tenant_id, incident_id, {
             "type": "TECH_LOCATION",
             "incident_id": incident_id,
+            "ts": now_iso(),
             "data": {"lat": lat, "lng": lng, "tecnico_id": tecnico_id},
         })
 
@@ -107,7 +115,18 @@ class WSManager:
         await self.publish(tenant_id, incident_id, {
             "type": "TECH_ARRIVED",
             "incident_id": incident_id,
+            "ts": now_iso(),
             "data": {"lat": lat, "lng": lng},
+        })
+
+    async def broadcast_eta_updated(
+        self, tenant_id: str, incident_id: str, eta_min: int | None
+    ):
+        await self.publish(tenant_id, incident_id, {
+            "type": "ETA_UPDATED",
+            "incident_id": incident_id,
+            "ts": now_iso(),
+            "data": {"eta_min": eta_min},
         })
 
     async def _listen(self):

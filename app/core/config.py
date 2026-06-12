@@ -26,8 +26,11 @@ class Settings(BaseSettings):
     resend_api_key: str = ""
     environment: str = "development"
     fcm_server_key: str = ""
+    fcm_service_account_path: str = ""
     openai_api_key: str = ""
     maps_api_key: str = ""
+    osrm_url: str = "http://osrm:5000"
+    osrm_public_url: str = "https://router.project-osrm.org"
     cors_origins: str = "http://localhost:4200"
     # Flutter web (Chrome/desktop) usa puertos dinámicos, p. ej. http://localhost:65360
     cors_origin_regex: str = r"http://(localhost|127\.0\.0\.1):\d+"
