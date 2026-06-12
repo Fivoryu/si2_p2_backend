@@ -79,10 +79,11 @@ def _send_via_resend(to_email: str, nombre: str, temp_password: str) -> bool:
         logger.info(f"[DEV] Temp password for {to_email}: {temp_password}")
         return False
     resend.api_key = settings.resend_api_key
+    sender = settings.resend_sender_email or "onboarding@resend.dev"
     try:
         resend.Emails.send(
             {
-                "from": "Auxilio App <onboarding@resend.dev>",
+                "from": f"Auxilio App <{sender}>",
                 "to": to_email,
                 "subject": "Tu cuenta en Auxilio App - Contraseña temporal",
                 "html": (

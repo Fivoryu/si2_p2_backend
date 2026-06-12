@@ -21,7 +21,8 @@ class Settings(BaseSettings):
     # Email provider: "console" (dev) | "ses" (AWS) | "resend"
     email_provider: str = "console"
     ses_sender_email: str = "noreply@auxilio.app"
-    # Resend email (legacy, usar email_provider en su lugar)
+    resend_sender_email: str = "app@fivoryu.duckdns.org"
+    # Resend email
     resend_api_key: str = ""
     environment: str = "development"
     fcm_server_key: str = ""
