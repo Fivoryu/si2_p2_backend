@@ -113,7 +113,7 @@ async def plan_webhook(request: Request):
     reference = payload.get("reference", "")
     # Extract invoice_id from reference (format: plan_{plan_id}_{invoice_id})
     parts = reference.split("_")
-    invoice_id = parts[-1] if len(parts) >= 4 else reference
+    invoice_id = parts[-1] if len(parts) >= 3 else reference
 
     # 3. Retrieve pending signup data
     redis_client = _get_redis()
